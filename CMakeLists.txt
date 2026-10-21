@@ -31,6 +31,7 @@ add_library(rp STATIC
   src/x11.cpp
   src/image.cpp
   src/inband.cpp
+  src/armor.cpp
   src/agent.cpp
   src/composer.cpp
   src/term.cpp

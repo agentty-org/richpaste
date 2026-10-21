@@ -1,4 +1,5 @@
 #include "rp/agent.hpp"
+#include "rp/armor.hpp"
 #include "rp/composer.hpp"
 #include "rp/sha256.hpp"
 #include "rp/term.hpp"
@@ -127,6 +128,26 @@ auto cmd_setup() -> int {
     return 0;
 }
 
+auto cmd_howto() -> int {
+    std::println(
+        "Your terminal can't hand the clipboard to programs, so paste images and files as text.\n"
+        "Nothing to install. Pick what your laptop runs:\n"
+        "\n"
+        "macOS: save this as a Shortcut or alias (it uses only built-in tools), run it after\n"
+        "copying a screenshot or a file, then press Cmd+V in the ssh window:\n"
+        "\n{}\n"
+        "\n"
+        "Windows (PowerShell), same idea:\n"
+        "\n{}\n"
+        "\n"
+        "Any OS, no terminal at all: open the page from `richpaste page > rp.html` in a browser,\n"
+        "paste or drop the image there, then paste the text it copies.\n"
+        "\n"
+        "The pasted text is one line that starts with richpaste:1: and carries the bytes and a sha256.",
+        armor::mac_snippet(), armor::windows_snippet());
+    return 0;
+}
+
 // ---- demo input box ----
 
 constexpr std::string_view help = "Ctrl+V or Alt+V paste  Enter send  Alt+Enter newline  Ctrl+C quit";
@@ -162,9 +183,9 @@ auto cmd_demo() -> int {
         o.tty_out = tty->out_fd();
         auto clip = paste(o);
         if (!clip) {
-            auto msg = clip.error().what;
-            std::ranges::replace(msg, '\n', ' ');
-            set_status("paste failed: " + msg);
+            // No route to your clipboard. The terminal's own paste still works for text,
+            // so tell the user how to turn an image into text first.
+            set_status("can't read your clipboard from here. images/files: run `richpaste howto` here once, then paste normally");
             return;
         }
         auto pasted = store(clip->items, paste_dir());
@@ -212,8 +233,36 @@ auto cmd_demo() -> int {
                            [&](const term::key::Char& c) { box.insert_text(c.utf8); },
                            [&](const term::key::Paste& p) {
                                // Some terminals send an empty paste when the clipboard holds an image.
-                               if (p.text.empty()) do_paste();
-                               else box.insert_text(p.text);
+                               if (p.text.empty()) {
+                                   do_paste();
+                                   return;
+                               }
+                               if (!armor::contains(p.text)) {
+                                   box.insert_text(p.text);
+                                   return;
+                               }
+                               // Text-armored images/files: decode back into the real bytes.
+                               auto sp = armor::split(p.text);
+                               std::vector<Item> items;
+                               for (auto& part : sp.parts)
+                                   if (auto* it = std::get_if<Item>(&part)) items.push_back(*it);
+                               auto stored = store(items, paste_dir());
+                               std::size_t next_item = 0;
+                               for (auto& part : sp.parts) {
+                                   if (auto* t = std::get_if<std::string>(&part)) {
+                                       box.insert_text(*t);
+                                   } else if (stored) {
+                                       auto& sp2 = stored->parts[next_item++];
+                                       std::visit(overloaded{
+                                                      [&](const std::string& s) { box.insert_text(s); },
+                                                      [&](const Chip& c) { box.insert_chip(c); },
+                                                  },
+                                                  sp2);
+                                   }
+                               }
+                               if (!sp.errors.empty()) view.status = "paste: " + sp.errors.front();
+                               else if (!stored) view.status = "paste: " + stored.error().what;
+                               else view.status = std::format("pasted {} item(s) from text", items.size());
                            },
                            [&](const term::key::Ctrl& c) {
                                switch (c.letter) {
@@ -308,6 +357,43 @@ int main(int argc, char** argv) {
         return 0;  // 0 = "match", so ssh includes the forward line
     }
     if (cmd == "setup") return cmd_setup();
+    if (cmd == "howto") return cmd_howto();
+    if (cmd == "page") {
+        std::print("{}", armor::html_page());
+        return 0;
+    }
+    if (cmd == "mac-snippet") {
+        std::println("{}", armor::mac_snippet());
+        return 0;
+    }
+    if (cmd == "win-snippet") {
+        std::println("{}", armor::windows_snippet());
+        return 0;
+    }
+    if (cmd == "decode") {
+        // Turns armored text on stdin back into files (for scripts and tests).
+        std::string in;
+        char buf[65536];
+        while (auto n = std::fread(buf, 1, sizeof(buf), stdin)) in.append(buf, n);
+        auto sp = armor::split(in);
+        std::vector<Item> items;
+        for (auto& part : sp.parts)
+            if (auto* it = std::get_if<Item>(&part)) items.push_back(*it);
+        for (auto& e : sp.errors) std::println(stderr, "richpaste: {}", e);
+        print_items(Clip{items, "text"}, argc > 2 ? fs::path(argv[2]) : paste_dir());
+        return sp.errors.empty() && !items.empty() ? 0 : 1;
+    }
+    if (cmd == "encode") {
+        // Test helper: armor a file.
+        if (argc < 3) return usage();
+        auto data = read_file(argv[2], 1u << 30);
+        if (!data) return 1;
+        auto mime = mime_for_name(fs::path(argv[2]).filename().string());
+        Item it = mime.is_image() ? Item{Image{mime, *data}}
+                                  : Item{File{FileName::sanitize(fs::path(argv[2]).filename().string()), mime, *data}};
+        std::print("{}", armor::encode(it));
+        return 0;
+    }
     if (cmd == "paste") return cmd_paste(argc, argv);
     if (cmd == "doctor") return cmd_doctor();
     if (cmd == "demo") return cmd_demo();
