@@ -1,5 +1,6 @@
 // Unit tests. No framework: each check prints and counts failures.
 
+#include "rp/armor.hpp"
 #include "rp/clipboard.hpp"
 #include "rp/composer.hpp"
 #include "rp/image.hpp"
@@ -315,6 +316,21 @@ int main() {
     test_inband();
     test_image();
     test_deflate_roundtrip_shape();
+    {
+        Bytes img(5000);
+        for (std::size_t i = 0; i < img.size(); ++i) img[i] = std::byte(i * 13);
+        auto line = armor::encode(Image{*Mime::parse("image/png"), img});
+        auto out = armor::expand({Text::repair("see " + line + " ok")});
+        check(out.size() == 3, "expand: text, image, text");
+        check(std::holds_alternative<Image>(out[1]) && std::get<Image>(out[1]).data == img, "expand: image bytes");
+        auto only = armor::expand({Text::repair(line + "\n")});
+        check(only.size() == 1 && std::holds_alternative<Image>(only[0]), "expand: lone block, no stray text");
+        auto plain = armor::expand({Text::repair("just text")});
+        check(plain.size() == 1 && std::get<Text>(plain[0]).str() == "just text", "expand: plain text untouched");
+        std::vector<std::string> errs;
+        auto cut = armor::expand({Text::repair(line.substr(0, line.size() / 2))}, &errs);
+        check(cut.empty() && errs.size() == 1, "expand: cut-short block reported");
+    }
     if (failures) {
         std::println("{} check(s) failed", failures);
         return 1;

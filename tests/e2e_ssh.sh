@@ -104,6 +104,20 @@ echo "$OUT" | grep -q "paste          ok" && [ "$(echo "$OUT" | got_sha)" = "$(e
 # 7. hook restarts a dead agent. No display for it, so it never reads your real clipboard.
 kill "$AGENT"; AGENT=
 sleep 0.2
+
+# 6b. clipboard holds an image *as text* (what the PowerShell/web/Mac snippets leave).
+#     Plain Ctrl+V through the forward must still deliver the image.
+"$BIN" encode "$T/shot.png" > "$T/armored.txt"
+"$BIN" serve-file "$LAPTOP_HOME/.richpaste/agent.sock" "$T/armored.txt" text 2>/dev/null &
+AGENT=$!
+sleep 0.3
+sshr "$BIN paste -o /tmp/rp-e2e-out2" > "$T/paths2" 2>&1 || true
+P=$(head -1 "$T/paths2")
+[ -f "$P" ] && [ "$(sha256sum < "$P" | cut -d' ' -f1)" = "$WANT" ] \
+    && ok "clipboard has the image as text: Ctrl+V over ssh still gives the image" || { bad "armored over ssh"; cat "$T/paths2"; }
+rm -rf /tmp/rp-e2e-out2
+kill "$AGENT"; AGENT=
+sleep 0.2
 RICHPASTE_NO_DISPLAY=1 sshr true >/dev/null 2>&1 || true
 HOME=$LAPTOP_HOME RICHPASTE_NO_DISPLAY=1 "$BIN" doctor 2>&1 | grep -q "(answering)" \
     && ok "ssh hook restarts a dead agent" || bad "agent auto-start"

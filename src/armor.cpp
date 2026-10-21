@@ -2,6 +2,7 @@
 
 #include "rp/sha256.hpp"
 
+#include <algorithm>
 #include <charconv>
 
 namespace rp::armor {
@@ -114,6 +115,29 @@ auto split(std::string_view s) -> Split {
         if (b.item) out.parts.emplace_back(std::move(*b.item));
         else out.errors.push_back(std::move(b.error));
         i = b.end;
+    }
+    return out;
+}
+
+auto expand(std::vector<Item> items, std::vector<std::string>* errors) -> std::vector<Item> {
+    std::vector<Item> out;
+    for (auto& item : items) {
+        auto* t = std::get_if<Text>(&item);
+        if (!t || !contains(t->str())) {
+            out.push_back(std::move(item));
+            continue;
+        }
+        auto sp = split(t->str());
+        for (auto& part : sp.parts) {
+            if (auto* s = std::get_if<std::string>(&part)) {
+                // Keep surrounding text, but drop the whitespace left between blocks.
+                bool blank = std::ranges::all_of(*s, [](char c) { return is_space(c); });
+                if (!blank) out.push_back(Text::repair(*s));
+            } else {
+                out.push_back(std::move(std::get<Item>(part)));
+            }
+        }
+        if (errors) errors->insert(errors->end(), sp.errors.begin(), sp.errors.end());
     }
     return out;
 }

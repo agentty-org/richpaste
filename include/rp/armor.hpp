@@ -26,6 +26,10 @@ struct Split {
 // Pulls every armored block out of pasted text. Plain text around them is kept.
 auto split(std::string_view text) -> Split;
 
+// Replaces any Text item that carries armored blocks with the items inside it.
+// Every paste route runs this, so an image copied as text arrives as the image.
+auto expand(std::vector<Item> items, std::vector<std::string>* errors = nullptr) -> std::vector<Item>;
+
 // Snippets that turn the clipboard into armored text using only what the OS ships.
 auto mac_snippet() -> std::string;
 // The same, but also pastes into the front window and restores the clipboard.

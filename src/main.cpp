@@ -250,25 +250,18 @@ auto cmd_demo() -> int {
                                    return;
                                }
                                // Text-armored images/files: decode back into the real bytes.
-                               auto sp = armor::split(p.text);
-                               std::vector<Item> items;
-                               for (auto& part : sp.parts)
-                                   if (auto* it = std::get_if<Item>(&part)) items.push_back(*it);
+                               std::vector<std::string> errs;
+                               auto items = armor::expand({Text::repair(p.text)}, &errs);
                                auto stored = store(items, paste_dir());
-                               std::size_t next_item = 0;
-                               for (auto& part : sp.parts) {
-                                   if (auto* t = std::get_if<std::string>(&part)) {
-                                       box.insert_text(*t);
-                                   } else if (stored) {
-                                       auto& sp2 = stored->parts[next_item++];
+                               if (stored) {
+                                   for (auto& part : stored->parts)
                                        std::visit(overloaded{
                                                       [&](const std::string& s) { box.insert_text(s); },
                                                       [&](const Chip& c) { box.insert_chip(c); },
                                                   },
-                                                  sp2);
-                                   }
+                                                  part);
                                }
-                               if (!sp.errors.empty()) view.status = "paste: " + sp.errors.front();
+                               if (!errs.empty()) view.status = "paste: " + errs.front();
                                else if (!stored) view.status = "paste: " + stored.error().what;
                                else view.status = std::format("pasted {} item(s) from text", items.size());
                            },

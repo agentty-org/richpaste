@@ -92,6 +92,13 @@ grep -q "see: \[image png 146.5 KB\]" "$T/screen" && grep -q "pasted from termin
     && ok "demo: Ctrl+V in kitty shows the image chip" || { bad "demo in kitty"; cat "$T/screen"; }
 kill "$OW"; OW=
 
+# --- image copied *as text* (snippet/web page output), Ctrl+V in kitty via plain OSC 52 ---
+"$BIN" encode "$T/shot.png" > "$T/armored.txt"
+xsel -b -i < "$T/armored.txt"; sleep 0.5
+run_kitty "RICHPASTE_TERMINAL=osc52 $APPENV $BIN paste -o $T/out8d > $T/out8 2>&1"
+P=$(head -1 "$T/out8")
+[ -f "$P" ] && cmp -s "$P" "$T/shot.png" && ok "image copied as text: Ctrl+V via OSC 52 gives the image" || { bad "armored via osc52"; head -c 300 "$T/out8"; }
+
 # --- nothing installed on the laptop: kitty -> ssh -> tmux on the server -> image ---
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 ssh-keygen -q -t ed25519 -N '' -f "$T/hk"; ssh-keygen -q -t ed25519 -N '' -f "$T/uk"; cp "$T/uk.pub" "$T/ak"

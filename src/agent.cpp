@@ -1,5 +1,6 @@
 #include "rp/agent.hpp"
 
+#include "rp/armor.hpp"
 #include "rp/inband.hpp"
 #include "rp/sha256.hpp"
 #include "rp/wire.hpp"
@@ -336,7 +337,15 @@ auto fetch(const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<s
     return wire::decode_response(*resp);
 }
 
-auto paste(const PasteOptions& opt) -> Result<Clip> { return paste_impl(opt, 0, in_ssh_session()); }
+auto paste(const PasteOptions& opt) -> Result<Clip> {
+    auto clip = paste_impl(opt, 0, in_ssh_session());
+    if (!clip) return clip;
+    // Whatever route it came by, an image or file copied as text arrives as itself.
+    std::vector<std::string> errors;
+    clip->items = armor::expand(std::move(clip->items), &errors);
+    if (!errors.empty() && clip->items.empty()) return fail("{}", errors.front());
+    return clip;
+}
 
 // The agent reads its own display first, and relays to the next hop if it has none.
 auto agent_source() -> Source {
