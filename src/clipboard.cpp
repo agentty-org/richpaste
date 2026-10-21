@@ -148,14 +148,14 @@ auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
     if (!r) return std::unexpected(r.error());
     return Clip{std::move(*r), "windows"};
 #elif defined(__APPLE__)
-    // An ssh login on a Mac has no GUI session; the pasteboard is still reachable.
-    if (!env("DISPLAY")) {
+    // Always the pasteboard: DISPLAY on a Mac only means XQuartz is installed.
+    {
         auto r = mac::read(max_bytes);
         if (!r) return std::unexpected(r.error());
         return Clip{std::move(*r), "macos"};
     }
 #endif
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
     std::vector<std::string> errors;
 
     // Wayland sockets: $WAYLAND_DISPLAY first, then any wayland-* in the runtime dir.

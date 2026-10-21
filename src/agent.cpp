@@ -145,10 +145,19 @@ auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forward
     Attempt a;
     if (prefer_forwards) {
         if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
-        // Over ssh, the terminal sits on the machine you type on, so ask it before
-        // reading whatever display the server happens to have.
+        // Over ssh, the terminal sits on the machine you type on, so ask it.
         if (auto r = from_terminal(opt, a)) return std::move(*r);
-        if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
+        // Don't fall back to this server's own display: that's not the clipboard you
+        // copied into, and pasting it silently gives stale text.
+        if (env("RICHPASTE_SERVER_CLIPBOARD")) {
+            if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
+        }
+        std::string why;
+        for (auto& e : a.errors) why += "\n  " + e;
+        return fail(
+            "can't reach the clipboard on the machine you're typing on.{}\n"
+            "Run `richpaste setup` on that machine (your laptop), then reconnect.",
+            why);
     } else {
         if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
         if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
