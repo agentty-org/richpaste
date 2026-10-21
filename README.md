@@ -45,8 +45,14 @@ route that exists, and fall back down the list:
 | 2 | **the terminal itself** (OSC 5522) | kitty-style terminal | text, images, files |
 | 3 | **the terminal itself** (OSC 52) | terminal that allows clipboard reads | text |
 | 4 | **this machine's display** | you're local | text, images, files |
+| 5 | **pasted as text** (`richpaste:1:` line) | a built-in helper on your machine (below) | text, images, files |
 
-Inside ssh, 1 → 2/3 → 4. Locally, 4 first. tmux is handled in every route.
+Inside ssh, 1 → 2/3. Locally, 4 first. tmux is handled in every route. Over ssh the
+server's own clipboard is never used, because it isn't the one you copied into.
+
+Whatever route a paste comes by, a `richpaste:1:` line in it turns back into the image or
+file. So for terminals that can't share the clipboard (Terminal.app, Windows Terminal),
+you turn the image into text on your machine, then paste normally.
 
 ```
 laptop                                         server
@@ -94,6 +100,21 @@ richpaste doctor               # shows which route paste would use, and why
 
 If you skip `setup`, paste still works in kitty (any type) and in terminals that
 allow OSC 52 reads (text).
+
+### Terminals that only paste text (Terminal.app, Windows Terminal)
+
+These never hand the clipboard to programs, so an image has to become text on your
+machine first. Nothing to install; `richpaste howto` prints the details:
+
+- **macOS hotkey:** a Shortcuts "Run Shell Script" bound to Ctrl+Cmd+V. It encodes the
+  clipboard, presses Cmd+V for you and puts the clipboard back. Built-in tools only
+  (`osascript`, `base64`, `shasum`, `pbcopy`).
+- **Windows:** a PowerShell one-liner (`richpaste win-snippet`), then paste as usual.
+- **Any OS:** `richpaste page > rp.html`, open it in a browser, paste the image there,
+  then paste the text it copies into the terminal.
+
+The line is `richpaste:1:<mime>:<name>:<size>:<sha256>:<base64>`. It survives wrapping
+and CRLF changes; a cut-short or corrupted paste is rejected, never saved broken.
 
 From C++, the whole client is one call:
 
@@ -165,6 +186,8 @@ macOS: same as Linux with Apple clang (`-DRICHPASTE_STATIC=OFF`).
 ./tests/e2e_ssh.sh                        # real sshd: ssh, tmux, stale panes, relay, restart
 DISPLAY=:N ./tests/inband_kitty.sh        # real kitty: OSC 5522/52, tmux, ssh, the input box
 DISPLAY=:N ./tests/wine_clip.sh build-win # Windows build under wine: clipboard formats, agent, ssh
+./tests/armor.sh                          # images as text: wrapping, corruption, tmux paste
+DISPLAY=:N ./tests/browser_page.sh        # the web page in real firefox
 python3 tests/png_check.py build/png_tool /tmp   # our PNG against an independent decoder
 ```
 
@@ -176,9 +199,9 @@ your clipboard. The terminal tests need an X server (Xvfb works).
 These can't be engineered away:
 
 - **Something on your machine has to hand the clipboard over.** That is the agent,
-  or a terminal that answers clipboard reads. A terminal with neither (for example
-  wezterm, alacritty, GNOME Terminal) can't give a server your clipboard; there you
-  need `richpaste setup`. richpaste says so in about a second instead of hanging.
+  a terminal that answers clipboard reads, or one of the text helpers above. A terminal
+  with none of these (Terminal.app, Windows Terminal, wezterm, alacritty) can't give a
+  server your clipboard. richpaste says so in about a second instead of hanging.
 - **Ctrl+V has to reach the app.** Windows Terminal and VS Code keep Ctrl+V for their
   own paste. Use Alt+V there, or unbind Ctrl+V. Terminals that send an empty
   bracketed paste for an image clipboard also trigger a fetch.
@@ -200,5 +223,6 @@ with nothing installed on the laptop), OSC 52 (direct and via tmux), the Windows
 build under wine (text, bitmaps, PNG, Explorer file copy, agent auth, and a Windows
 agent serving a Linux server over a real ssh forward).
 
-macOS compiles (checked against the macOS code paths) but hasn't run on a Mac yet.
+macOS compiles (cross-built with zig) but hasn't run on a Mac yet, and neither have the
+macOS hotkey or the PowerShell snippet. The browser page was tested in real Firefox.
 Under wine, Windows' own ssh.exe wasn't available, so the Linux ssh client stood in for it.
