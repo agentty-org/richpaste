@@ -153,10 +153,13 @@ auto windows_snippet() -> std::string {
 auto html_page() -> std::string {
     return R"HTML(<!doctype html>
 <meta charset="utf-8"><title>richpaste</title>
-<style>body{font:16px system-ui;margin:3em;max-width:40em}#s{margin-top:1em}textarea{width:100%;height:6em}</style>
+<style>body{font:16px system-ui;margin:3em;max-width:40em}#s{margin-top:1em}textarea{width:100%;height:6em}
+#z{border:2px dashed #888;border-radius:8px;padding:2em;text-align:center;outline:none;caret-color:transparent}
+#z:focus{border-color:#06c}</style>
 <h2>Paste or drop an image or file here</h2>
-<p>Press Cmd+V (or Ctrl+V), or drop a file. It becomes one line of text on your clipboard.
-Then paste that into the terminal app. Nothing leaves this page.</p>
+<p>Click the box, press Cmd+V (or Ctrl+V), or drop a file on it. It becomes one line of text on
+your clipboard. Then paste that into the terminal app. Nothing leaves this page.</p>
+<div id="z" contenteditable="true" autofocus>paste here</div>
 <div id="s">waiting...</div><button id="b" hidden>Copy text</button><textarea id="t" hidden readonly></textarea>
 <script>
 function b64(bytes){let s='';for(let i=0;i<bytes.length;i+=32768)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+32768));return btoa(s)}
@@ -168,10 +171,20 @@ const S=document.getElementById('s'),B=document.getElementById('b'),T=document.g
 async function done(text){T.value=text;try{await navigator.clipboard.writeText(text);S.textContent='Copied ('+text.length+' chars). Now paste in the terminal.';return}catch(e){}
 T.hidden=false;B.hidden=false;S.textContent='Ready. Click "Copy text", then paste in the terminal.'}
 B.onclick=()=>{T.select();document.execCommand('copy');S.textContent='Copied. Now paste in the terminal.'};
-async function handle(files){if(!files.length){S.textContent='No image or file in that paste.';return}S.textContent='Encoding...';const parts=[];for(const f of files)parts.push(await take(f));done(parts.join(' '))}
-document.addEventListener('paste',e=>{e.preventDefault();const fs=[...e.clipboardData.items].filter(i=>i.kind==='file').map(i=>i.getAsFile());handle(fs)});
+async function encodeAll(files){const parts=[];for(const f of files)parts.push(await take(f));return parts.join(' ')}
+async function handle(files){if(!files.length){S.textContent='No image or file in that paste.';return}S.textContent='Encoding...';done(await encodeAll(files))}
+function filesOf(dt){const fs=[...(dt.files||[])];if(fs.length)return fs;return [...(dt.items||[])].filter(i=>i.kind==='file').map(i=>i.getAsFile()).filter(Boolean)}
+// Safari only allows clipboard writes inside the user's gesture. Handing it a ClipboardItem
+// whose content is a promise, synchronously, keeps the gesture while we encode.
+function pasteNow(files){if(!files.length){S.textContent='No image or file in that paste.';return}
+if(window.ClipboardItem&&navigator.clipboard&&navigator.clipboard.write){S.textContent='Encoding...';const p=encodeAll(files);
+try{navigator.clipboard.write([new ClipboardItem({'text/plain':p.then(t=>{T.value=t;return new Blob([t],{type:'text/plain'})})})]).then(()=>{S.textContent='Copied ('+T.value.length+' chars). Now paste in the terminal.'},()=>p.then(done));return}catch(e){}}
+handle(files)}
+const Z=document.getElementById('z');Z.focus();
+document.addEventListener('paste',e=>{e.preventDefault();pasteNow(filesOf(e.clipboardData))});
+Z.addEventListener('input',()=>{Z.textContent='paste here'});
 document.addEventListener('dragover',e=>e.preventDefault());
-document.addEventListener('drop',e=>{e.preventDefault();handle([...e.dataTransfer.files])});
+document.addEventListener('drop',e=>{e.preventDefault();pasteNow(filesOf(e.dataTransfer))});
 if(typeof module!=='undefined')module.exports={armor};
 </script>
 )HTML";
