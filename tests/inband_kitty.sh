@@ -2,7 +2,8 @@
 # Zero-install paste through the terminal itself, in a real kitty window.
 # The app can't see any display or agent, so the only way in is OSC 5522 / OSC 52.
 # Needs: kitty, tmux, an X server for kitty (Xvfb is fine), xsel.
-# Usage: DISPLAY=:91 tests/inband_kitty.sh
+# Usage: DISPLAY=:N tests/inband_kitty.sh  (use a fresh X server: kitty trims a trailing
+# non-ASCII char from OSC 52 replies after an image app has owned the X clipboard)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/richpaste
@@ -28,6 +29,18 @@ run_kitty() {  # $1 = command inside kitty
     LIBGL_ALWAYS_SOFTWARE=1 timeout 40 kitty --config "$T/kitty.conf" sh -c "$1" >/dev/null 2>&1
 }
 
+# --- text through OSC 52 (forced, so kitty takes the plain OSC 52 path) ---
+# Runs first: after an image app has owned the X clipboard, kitty's OSC 52 reply drops a
+# trailing non-ASCII char (seen with a bare python probe too, so it's kitty, not us).
+setclip() {  # set the clipboard and wait until it reads back
+    printf '%s' "$1" | xsel -b -i
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(xsel -b -o 2>/dev/null)" = "$1" ] && break; sleep 0.1; done
+    sleep 0.3
+}
+setclip 'plain text via osc52 ✓'
+run_kitty "RICHPASTE_TERMINAL=osc52 $APPENV $BIN paste > $T/out3 2>&1"
+[ "$(cat "$T/out3")" = 'plain text via osc52 ✓' ] && ok "kitty: text via OSC 52" || { bad "osc52"; cat "$T/out3"; }
+
 # --- image through OSC 5522, kitty directly ---
 head -c 150000 /dev/urandom > "$T/shot.png"
 WANT=$(sha256sum < "$T/shot.png" | cut -c1-16)
@@ -41,18 +54,9 @@ grep -q "ok via terminal (OSC 5522)" "$T/out1" && grep -q "$WANT" "$T/out1" \
 run_kitty "tmux -L rpib -f /dev/null new '$APPENV $BIN doctor > $T/out2 2>&1'"
 grep -q "ok via terminal (OSC 5522)" "$T/out2" && grep -q "$WANT" "$T/out2" \
     && ok "kitty + tmux: image via passthrough, sha matches" || { bad "kitty+tmux 5522"; cat "$T/out2"; }
-kill "$OW"; OW=
+kill "$OW"; wait "$OW" 2>/dev/null; OW=
 # tmux setting must be per-pane only; the global one must be untouched.
 tmux -L rpib kill-server 2>/dev/null
-
-# --- text through OSC 52 (forced, so kitty takes the plain OSC 52 path) ---
-setclip() {  # set the clipboard and wait until it reads back
-    printf '%s' "$1" | xsel -b -i
-    for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(xsel -b -o 2>/dev/null)" = "$1" ] && return; sleep 0.1; done
-}
-setclip 'plain text via osc52 ✓'
-run_kitty "RICHPASTE_TERMINAL=osc52 $APPENV $BIN paste > $T/out3 2>&1"
-[ "$(cat "$T/out3")" = 'plain text via osc52 ✓' ] && ok "kitty: text via OSC 52" || { bad "osc52"; cat "$T/out3"; }
 
 # --- text through tmux asking the outer terminal (refresh-client -l), default tmux config ---
 setclip 'text via tmux refresh'
