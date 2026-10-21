@@ -73,6 +73,11 @@ for tool in curl brew python3 perl ruby jq; do
     echo "$S" | grep -qw "$tool" && { bad "mac snippet uses $tool"; continue; }
 done
 echo "$S" | sh -n 2>/dev/null && ok "mac snippet is valid sh, only osascript/base64/shasum/pbcopy" || bad "mac snippet syntax"
+H=$("$BIN" mac-hotkey)
+for tool in curl brew python3 perl ruby jq; do
+    echo "$H" | grep -qw "$tool" && bad "hotkey script uses $tool"
+done
+echo "$H" | sh -n 2>/dev/null && ok "mac hotkey script is valid sh, built-in tools only" || bad "hotkey syntax"
 
 echo
 echo "$PASS passed, $FAIL failed"

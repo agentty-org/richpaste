@@ -130,21 +130,29 @@ auto cmd_setup() -> int {
 
 auto cmd_howto() -> int {
     std::println(
-        "Your terminal can't hand the clipboard to programs, so paste images and files as text.\n"
-        "Nothing to install. Pick what your laptop runs:\n"
+        "Ctrl+V in a terminal app runs on this server. It can't read your Mac's clipboard:\n"
+        "Terminal.app only ever sends text, and never answers programs that ask for the clipboard.\n"
+        "So the image has to be turned into text on the Mac, before it's pasted. That needs one\n"
+        "keyboard shortcut on the Mac, made from built-in parts. Nothing to install.\n"
         "\n"
-        "macOS: save this as a Shortcut or alias (it uses only built-in tools), run it after\n"
-        "copying a screenshot or a file, then press Cmd+V in the ssh window:\n"
-        "\n{}\n"
+        "One-time setup (about a minute):\n"
+        "  1. Open the Shortcuts app, make a new shortcut called \"Rich paste\".\n"
+        "  2. Add the action \"Run Shell Script\" and paste the script below into it.\n"
+        "  3. Shortcut details (i) > Add Keyboard Shortcut > press Ctrl+Cmd+V.\n"
+        "  4. First run only: allow Shortcuts in System Settings > Privacy > Accessibility\n"
+        "     (it needs that to press Cmd+V for you).\n"
         "\n"
-        "Windows (PowerShell), same idea:\n"
-        "\n{}\n"
+        "Then: copy a screenshot or a file, click the ssh window, press Ctrl+Cmd+V.\n"
+        "It pastes the image as text, the app turns it back into the image, and your\n"
+        "clipboard is put back the way it was. Plain text just pastes normally.\n"
         "\n"
-        "Any OS, no terminal at all: open the page from `richpaste page > rp.html` in a browser,\n"
-        "paste or drop the image there, then paste the text it copies.\n"
+        "---- script ----\n{}\n---- end ----\n"
         "\n"
-        "The pasted text is one line that starts with richpaste:1: and carries the bytes and a sha256.",
-        armor::mac_snippet(), armor::windows_snippet());
+        "Windows laptop (PowerShell), run after copying, then paste with Ctrl+Shift+V:\n{}\n"
+        "\n"
+        "Any OS, nothing at all: `richpaste page > rp.html`, open it in a browser, paste the\n"
+        "image there, then paste the text it copies into the terminal.",
+        armor::mac_hotkey_script(), armor::windows_snippet());
     return 0;
 }
 
@@ -185,7 +193,7 @@ auto cmd_demo() -> int {
         if (!clip) {
             // No route to your clipboard. The terminal's own paste still works for text,
             // so tell the user how to turn an image into text first.
-            set_status("can't read your clipboard from here. images/files: run `richpaste howto` here once, then paste normally");
+            set_status("your terminal won't share the clipboard over ssh. one-time Mac setup: run `richpaste howto`");
             return;
         }
         auto pasted = store(clip->items, paste_dir());
@@ -364,6 +372,10 @@ int main(int argc, char** argv) {
     }
     if (cmd == "mac-snippet") {
         std::println("{}", armor::mac_snippet());
+        return 0;
+    }
+    if (cmd == "mac-hotkey") {
+        std::println("{}", armor::mac_hotkey_script());
         return 0;
     }
     if (cmd == "win-snippet") {

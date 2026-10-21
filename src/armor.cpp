@@ -123,6 +123,28 @@ auto mac_snippet() -> std::string {
     return R"SH(d=$(mktemp -d); f=$d/c; if p=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null) && [ -f "$p" ]; then cp "$p" "$f"; n=$(printf %s "$(basename "$p")" | base64 | tr -d '\n'); m=application/octet-stream; else osascript -e "set f to open for access POSIX file \"$f\" with write permission" -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' >/dev/null 2>&1; n=; m=image/png; fi; if [ -s "$f" ]; then printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$(wc -c < "$f" | tr -d ' ')" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy; echo 'ready: press Cmd+V in the ssh window'; else echo 'no image or file on the clipboard'; fi; rm -rf "$d")SH";
 }
 
+auto mac_hotkey_script() -> std::string {
+    // For a Shortcuts "Run Shell Script" action bound to a key. Built-in tools only.
+    // Encodes the clipboard, pastes it into the front window, then puts the original back.
+    return R"SH(d=$(mktemp -d); f=$d/c; r=
+if p=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null) && [ -f "$p" ]; then
+  cp "$p" "$f"; n=$(printf %s "$(basename "$p")" | base64 | tr -d '\n'); m=application/octet-stream; r=file
+else
+  osascript -e "set f to open for access POSIX file \"$f\" with write permission" -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' >/dev/null 2>&1
+  n=; m=image/png; r=png
+fi
+if [ ! -s "$f" ]; then
+  # Plain text: just paste it as usual.
+  sleep 0.3; osascript -e 'tell application "System Events" to keystroke "v" using command down'; rm -rf "$d"; exit 0
+fi
+printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$(wc -c < "$f" | tr -d ' ')" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy
+sleep 0.3
+osascript -e 'tell application "System Events" to keystroke "v" using command down'
+sleep 1
+if [ "$r" = png ]; then osascript -e "set the clipboard to (read POSIX file \"$f\" as «class PNGf»)"; else osascript -e "set the clipboard to (POSIX file \"$p\")"; fi
+rm -rf "$d")SH";
+}
+
 auto windows_snippet() -> std::string {
     // Stock Windows PowerShell 5.1. Copied file -> that file; otherwise the image (as PNG).
     return R"PS(Add-Type -A System.Windows.Forms,System.Drawing; $c=[Windows.Forms.Clipboard]; if($c::ContainsFileDropList()){$p=$c::GetFileDropList()[0]; $b=[IO.File]::ReadAllBytes($p); $n=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFileName($p))); $m='application/octet-stream'} elseif($c::ContainsImage()){$s=New-Object IO.MemoryStream; $c::GetImage().Save($s,[Drawing.Imaging.ImageFormat]::Png); $b=$s.ToArray(); $n=''; $m='image/png'} else {'no image or file on the clipboard'; return}; $h=-join([Security.Cryptography.SHA256]::Create().ComputeHash($b)|%{$_.ToString('x2')}); Set-Clipboard -Value "richpaste:1:${m}:${n}:$($b.Length):${h}:$([Convert]::ToBase64String($b))"; 'ready: paste in the ssh window')PS";

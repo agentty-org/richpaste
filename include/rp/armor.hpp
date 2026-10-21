@@ -28,6 +28,9 @@ auto split(std::string_view text) -> Split;
 
 // Snippets that turn the clipboard into armored text using only what the OS ships.
 auto mac_snippet() -> std::string;
+// The same, but also pastes into the front window and restores the clipboard.
+// Meant for a macOS Shortcut bound to a hotkey: copy, press the hotkey, done.
+auto mac_hotkey_script() -> std::string;
 auto windows_snippet() -> std::string;
 // A self-contained web page that does the same in any browser.
 auto html_page() -> std::string;
