@@ -59,7 +59,7 @@ if command -v node >/dev/null; then
     node -e "
 const fs=require('fs');const html=fs.readFileSync(process.argv[1],'utf8');
 const js=html.split('<script>')[1].split('</script>')[0];
-const pre='const document={getElementById:()=>({}),addEventListener(){}};const navigator={};';
+const pre='const el={focus(){},addEventListener(){}};const document={getElementById:()=>el,addEventListener(){}};const navigator={};';
 const module={exports:{}};new Function('module','crypto','btoa',pre+js)(module,globalThis.crypto,globalThis.btoa);
 module.exports.armor('image/png','',new Uint8Array(fs.readFileSync(process.argv[2]))).then(s=>fs.writeFileSync(process.argv[3],s));
 " "$T/rp.html" "$T/shot.png" "$T/js.txt"
