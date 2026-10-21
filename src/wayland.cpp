@@ -1,5 +1,6 @@
 // Minimal Wayland client that reads the clipboard through data-control.
 // Speaks the wire protocol directly over the socket, no libwayland.
+#ifndef _WIN32
 //
 // ext_data_control_v1 and zwlr_data_control_v1 have the same opcodes, so one
 // code path handles both. GNOME has neither; there we fall back to X11.
@@ -12,6 +13,10 @@
 #include <map>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0
+#endif
 
 namespace rp::wayland {
 
@@ -239,7 +244,9 @@ struct Session {
 
     auto receive(std::uint32_t offer, std::string_view mime, std::size_t max) -> Result<Bytes> {
         int p[2];
-        if (::pipe2(p, O_CLOEXEC) < 0) return fail("pipe: {}", errno_str());
+        if (::pipe(p) < 0) return fail("pipe: {}", errno_str());
+        ::fcntl(p[0], F_SETFD, FD_CLOEXEC);
+        ::fcntl(p[1], F_SETFD, FD_CLOEXEC);
         Fd rd(p[0]), wr(p[1]);
         ArgWriter w;
         w.str(mime);
@@ -296,3 +303,5 @@ auto read(const std::string& socket_path, std::uint64_t max_bytes) -> Result<std
 }
 
 }  // namespace rp::wayland
+
+#endif

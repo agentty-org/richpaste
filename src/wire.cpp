@@ -2,6 +2,8 @@
 
 #include "rp/sha256.hpp"
 
+#include <algorithm>
+
 namespace rp::wire {
 
 namespace {
@@ -35,6 +37,7 @@ auto encode_request(const Request& r) -> Bytes {
     w.put(std::to_underlying(r.op));
     w.put(r.max_total_bytes);
     w.put(r.hops);
+    w.put_str16(r.token.substr(0, max_token));
     return std::move(w).bytes();
 }
 
@@ -45,9 +48,12 @@ auto decode_request(ByteView b) -> Result<Request> {
     auto max = r.get<std::uint64_t>();
     auto hops = r.get<std::uint32_t>();
     if (!op || !max || !hops) return fail("truncated request");
+    auto token = r.str16();
+    if (!token) return fail("truncated request");
+    if (token->size() > max_token) return fail("token too long");
     if (*op != std::to_underlying(Op::clipboard)) return fail("unknown request op {}", *op);
     if (*hops > max_hops) return fail("request relayed through too many machines (loop?)");
-    return Request{Op::clipboard, *max, *hops};
+    return Request{Op::clipboard, *max, *hops, std::move(*token)};
 }
 
 auto encoded_size(const Item& item) -> std::uint64_t {

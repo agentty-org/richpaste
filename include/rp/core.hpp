@@ -51,7 +51,7 @@ class Mime {
 public:
     static auto parse(std::string_view s) -> Result<Mime>;
     [[nodiscard]] auto str() const -> std::string_view { return s_; }
-    [[nodiscard]] auto essence() const -> std::string_view { return s_.substr(0, s_.find(';')); }
+    [[nodiscard]] auto essence() const -> std::string_view { return str().substr(0, s_.find(';')); }
     [[nodiscard]] auto is_image() const -> bool { return s_.starts_with("image/"); }
     friend auto operator==(const Mime&, const Mime&) -> bool = default;
 
@@ -140,5 +140,9 @@ auto mime_for_name(std::string_view name) -> Mime;
 auto ext_for_mime(std::string_view mime) -> std::string_view;
 
 auto human_size(std::uint64_t n) -> std::string;
+
+auto base64_encode(ByteView data) -> std::string;
+// Strict RFC 4648: standard alphabet, padding required, no whitespace.
+auto base64_decode(std::string_view s) -> Result<Bytes>;
 
 }  // namespace rp

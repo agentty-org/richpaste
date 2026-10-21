@@ -4,37 +4,34 @@
 #include "rp/term.hpp"
 
 #include <algorithm>
-#include <csignal>
 #include <cstdio>
 #include <print>
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace rp;
 
 namespace {
 
-auto self_exe() -> fs::path {
-    std::error_code ec;
-    auto p = fs::read_symlink("/proc/self/exe", ec);
-    return ec ? fs::path("richpaste") : p;
-}
-
 auto usage() -> int {
     std::println(stderr,
                  "richpaste: paste anything into a terminal app, even over ssh and tmux\n"
                  "\n"
                  "on the machine you type on:\n"
-                 "  richpaste setup              add the ssh hook to ~/.ssh/config (once)\n"
+                 "  richpaste setup              add the ssh hook to ~/.ssh/config and start the agent (once)\n"
                  "  richpaste agent              run the clipboard agent in the foreground\n"
                  "\n"
                  "anywhere (local or over ssh):\n"
-                 "  richpaste demo               an input box; Ctrl+V pastes text, images, files\n"
+                 "  richpaste demo               an input box; Ctrl+V (or Alt+V) pastes text, images, files\n"
                  "  richpaste paste [-o DIR]     print text, or save images/files and print paths\n"
                  "  richpaste doctor             show what paste would use and why\n");
     return 2;
 }
+
+auto paste_dir() -> fs::path { return state_dir() / "pasted"; }
 
 void print_items(const Clip& clip, const fs::path& dir) {
     auto pasted = store(clip.items, dir);
@@ -51,7 +48,17 @@ void print_items(const Clip& clip, const fs::path& dir) {
     std::fflush(stdout);
 }
 
-auto paste_dir() -> fs::path { return state_dir() / "pasted"; }
+// Pastes, asking the terminal as a last resort when we have one.
+auto paste_with_terminal(std::uint64_t max) -> Result<Clip> {
+    PasteOptions o;
+    o.max_bytes = max;
+    auto tty = term::Tty::open();
+    if (tty) {
+        o.tty_in = tty->in_fd();
+        o.tty_out = tty->out_fd();
+    }
+    return paste(o);
+}
 
 auto cmd_paste(int argc, char** argv) -> int {
     fs::path dir = paste_dir();
@@ -60,7 +67,7 @@ auto cmd_paste(int argc, char** argv) -> int {
         if ((a == "-o" || a == "--out") && i + 1 < argc) dir = argv[++i];
         else return usage();
     }
-    auto clip = paste();
+    auto clip = paste_with_terminal(default_max_bytes);
     if (!clip) {
         std::println(stderr, "richpaste: {}", clip.error().what);
         return 1;
@@ -70,19 +77,16 @@ auto cmd_paste(int argc, char** argv) -> int {
 }
 
 auto cmd_doctor() -> int {
-    std::println("agent socket   {}  {}", agent_socket_path().string(),
-                 unix_connect(agent_socket_path()) ? "(answering)" : "(not running)");
+    auto ep = local_endpoint();
+    std::println("agent          {}  {}", ep ? describe(*ep) : "-", agent_alive() ? "(answering)" : "(not running)");
     std::println("display env    WAYLAND_DISPLAY={} DISPLAY={}", env("WAYLAND_DISPLAY").value_or("-"),
                  env("DISPLAY").value_or("-"));
     std::println("ssh session    SSH_CONNECTION={}  TMUX={}", env("SSH_CONNECTION").value_or("-"),
                  env("TMUX") ? "yes" : "no");
     auto socks = find_forwarded_sockets();
     std::println("forwards       {} found", socks.size());
-    for (auto& s : socks) {
-        auto ok = unix_connect(s);
-        std::println("  {}  {}", s.string(), ok ? "(live)" : "(dead)");
-    }
-    auto clip = paste(64 << 20);
+    for (auto& s : socks) std::println("  {}  {}", s.string(), unix_connect(s) ? "(live)" : "(dead)");
+    auto clip = paste_with_terminal(64 << 20);
     if (!clip) {
         std::println("paste          FAILED: {}", clip.error().what);
         return 1;
@@ -102,9 +106,10 @@ auto cmd_setup() -> int {
     if (current.contains("# richpaste:")) {
         std::println("richpaste is already in {}", cfg.string());
     } else {
-        std::error_code ec;
-        fs::create_directories(cfg.parent_path(), ec);
-        ::chmod(cfg.parent_path().c_str(), 0700);
+        if (auto d = ensure_private_dir(cfg.parent_path()); !d) {
+            std::println(stderr, "richpaste: {}", d.error().what);
+            return 1;
+        }
         // Match blocks must not end up inside someone's Host block, so prepend.
         auto out = snippet + "\n" + current;
         if (auto w = write_file_atomic(cfg, as_view(out)); !w) {
@@ -118,27 +123,28 @@ auto cmd_setup() -> int {
         return 1;
     }
     std::println("agent is running. new ssh sessions will carry your clipboard.");
-    std::println("on the server, copy this same binary into PATH (it has no dependencies).");
+    std::println("on the server, copy the Linux/macOS binary into PATH (it has no dependencies).");
     return 0;
 }
 
 // ---- demo input box ----
 
+constexpr std::string_view help = "Ctrl+V or Alt+V paste  Enter send  Alt+Enter newline  Ctrl+C quit";
+
 auto cmd_demo() -> int {
-    auto raw = term::Raw::enter(STDIN_FILENO);
-    if (!raw) {
-        std::println(stderr, "richpaste: {}", raw.error().what);
+    auto tty = term::Tty::open();
+    if (!tty) {
+        std::println(stderr, "richpaste: {}", tty.error().what);
         return 1;
     }
-    std::signal(SIGPIPE, SIG_IGN);
     Composer box;
     term::Parser parser;
     term::View view;
-    view.status = "Ctrl+V paste  Enter send  Alt+Enter newline  Ctrl+C quit";
+    view.status = help;
     int rows_above = 0;
-    auto out = [](std::string_view s) { (void)write_all(STDOUT_FILENO, as_view(s), Millis(1000)); };
+    auto out = [&](std::string_view s) { (void)tty->write(s); };
     auto draw = [&] {
-        view.width = term::size(STDOUT_FILENO).first;
+        view.width = tty->size().first;
         auto [s, r] = term::render(box, view, rows_above);
         out(s);
         rows_above = r;
@@ -150,7 +156,11 @@ auto cmd_demo() -> int {
 
     auto do_paste = [&] {
         set_status("pasting...");
-        auto clip = paste();
+        // The terminal fallback reads replies straight off the tty, so nothing else may read it now.
+        PasteOptions o;
+        o.tty_in = tty->in_fd();
+        o.tty_out = tty->out_fd();
+        auto clip = paste(o);
         if (!clip) {
             auto msg = clip.error().what;
             std::ranges::replace(msg, '\n', ' ');
@@ -176,21 +186,20 @@ auto cmd_demo() -> int {
         view.status.clear();
         draw();
         out("\r\n");
-        std::string sent = box.to_text();
         std::string shown;
-        for (char ch : sent) shown += ch == '\n' ? std::string("\r\n  ") : std::string(1, ch);
+        for (char ch : box.to_text()) shown += ch == '\n' ? std::string("\r\n  ") : std::string(1, ch);
         out(std::format("\x1b[2msent:\x1b[22m {}\r\n", shown));
         for (auto& c : box.chips())
             out(std::format("  \x1b[2m{} {} sha256:{}\x1b[22m\r\n", c.mime, human_size(c.size), c.sha256.substr(0, 16)));
         box.clear();
         rows_above = 0;
-        set_status("Ctrl+V paste  Enter send  Alt+Enter newline  Ctrl+C quit");
+        set_status(std::string(help));
     };
 
     draw();
     std::array<std::byte, 4096> buf;
     for (;;) {
-        auto n = read_some(STDIN_FILENO, buf, parser.pending() ? Millis(30) : Millis(1 << 30));
+        auto n = tty->read(buf, parser.pending() ? Millis(30) : Millis(1 << 30));
         if (!n) {
             if (auto k = parser.flush_escape()) parser.feed({});
             continue;
@@ -220,6 +229,10 @@ auto cmd_demo() -> int {
                                    default: break;
                                }
                            },
+                           // For terminals that keep Ctrl+V for themselves (Windows Terminal, VS Code).
+                           [&](const term::key::Alt& a) {
+                               if (a.letter == 'v') do_paste();
+                           },
                            [&](const term::key::Enter&) {
                                if (!box.empty()) submit();
                            },
@@ -244,7 +257,7 @@ auto cmd_demo() -> int {
     return 0;
 }
 
-// Test helper: serve one fixed file as the clipboard.
+// Test helper: serve one fixed file as the clipboard on a unix socket.
 auto cmd_serve_file(int argc, char** argv) -> int {
     if (argc < 4) return usage();
     fs::path socket = argv[2];
@@ -267,7 +280,7 @@ auto cmd_serve_file(int argc, char** argv) -> int {
         return Image{std::move(mime), *data};
     }();
     Source src = [item](std::uint64_t, std::uint32_t) -> Result<Clip> { return Clip{{item}, "file"}; };
-    auto r = run_agent(socket, src, false);
+    auto r = run_agent_at(socket, src, false);
     if (!r) {
         std::println(stderr, "richpaste: {}", r.error().what);
         return 1;
@@ -278,10 +291,11 @@ auto cmd_serve_file(int argc, char** argv) -> int {
 }  // namespace
 
 int main(int argc, char** argv) {
+    platform_init();
     if (argc < 2) return usage();
     std::string_view cmd = argv[1];
     if (cmd == "agent") {
-        auto r = run_agent(agent_socket_path(), agent_source(), false);
+        auto r = run_agent(agent_source(), false);
         if (!r) {
             std::println(stderr, "richpaste: {}", r.error().what);
             return 1;
@@ -298,5 +312,14 @@ int main(int argc, char** argv) {
     if (cmd == "doctor") return cmd_doctor();
     if (cmd == "demo") return cmd_demo();
     if (cmd == "serve-file") return cmd_serve_file(argc, argv);
+    if (cmd == "test-fetch-notoken") {
+        // Test helper: ask the local agent without its token (Windows same-user check).
+        auto e = local_endpoint();
+        if (!e) return 1;
+        if (auto* t = std::get_if<TcpEndpoint>(&*e)) t->token.clear();
+        auto r = fetch(*e, 1 << 20);
+        std::println("{}", r ? "served" : r.error().what);
+        return r ? 0 : 1;
+    }
     return usage();
 }

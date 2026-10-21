@@ -1,6 +1,7 @@
 // Minimal X11 client that reads the CLIPBOARD selection.
 // Speaks the core protocol directly over the socket, no Xlib/xcb.
 // Handles Xauthority cookies and INCR transfers (big images).
+#ifndef _WIN32
 
 #include "rp/clipboard.hpp"
 #include "rp/io.hpp"
@@ -381,3 +382,5 @@ auto read(const std::string& display, std::uint64_t max_bytes) -> Result<std::ve
 }
 
 }  // namespace rp::x11
+
+#endif

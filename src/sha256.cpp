@@ -1,5 +1,6 @@
 #include "rp/sha256.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
 
@@ -94,6 +95,29 @@ auto sha256(std::span<const std::byte> data) -> Digest {
     Sha256 s;
     s.update(data);
     return s.finish();
+}
+
+auto hmac_sha256(std::span<const std::byte> key, std::span<const std::byte> msg) -> Digest {
+    std::array<std::byte, 64> k{};
+    if (key.size() > 64) {
+        auto d = sha256(key);
+        std::ranges::copy(d, k.begin());
+    } else {
+        std::ranges::copy(key, k.begin());
+    }
+    std::array<std::byte, 64> ipad, opad;
+    for (std::size_t i = 0; i < 64; ++i) {
+        ipad[i] = k[i] ^ std::byte{0x36};
+        opad[i] = k[i] ^ std::byte{0x5c};
+    }
+    Sha256 inner;
+    inner.update(ipad);
+    inner.update(msg);
+    auto ih = inner.finish();
+    Sha256 outer;
+    outer.update(opad);
+    outer.update(ih);
+    return outer.finish();
 }
 
 auto hex(std::span<const std::byte> data) -> std::string {

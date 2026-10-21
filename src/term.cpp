@@ -1,25 +1,109 @@
 #include "rp/term.hpp"
 
 #include <memory>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 namespace rp::term {
 
-struct Raw::Saved {
-    termios t;
+#ifdef _WIN32
+
+struct Tty::State {
+    HANDLE in = INVALID_HANDLE_VALUE;
+    HANDLE out = INVALID_HANDLE_VALUE;
+    DWORD in_mode = 0, out_mode = 0;
+    UINT in_cp = 0, out_cp = 0;
 };
 
-Raw::Raw(int fd) : fd_(fd), saved_(std::make_unique<Saved>()) {}
+auto Tty::open() -> Result<Tty> {
+    auto s = std::make_unique<State>();
+    s->in = ::CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                          OPEN_EXISTING, 0, nullptr);
+    s->out = ::CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (s->in == INVALID_HANDLE_VALUE || s->out == INVALID_HANDLE_VALUE) return fail("no console");
+    if (!::GetConsoleMode(s->in, &s->in_mode) || !::GetConsoleMode(s->out, &s->out_mode))
+        return fail("not a console");
+    s->in_cp = ::GetConsoleCP();
+    s->out_cp = ::GetConsoleOutputCP();
+    ::SetConsoleCP(CP_UTF8);
+    ::SetConsoleOutputCP(CP_UTF8);
+    // VT input gives us the same byte stream a Unix tty would, Ctrl+V included.
+    DWORD in = ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS;
+    DWORD out = s->out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT | DISABLE_NEWLINE_AUTO_RETURN;
+    if (!::SetConsoleMode(s->in, in)) return fail("this console has no VT input (needs Windows 10 or newer)");
+    ::SetConsoleMode(s->out, out);
+    Tty t(std::move(s));
+    (void)t.write("\x1b[?2004h");
+    return t;
+}
 
-Raw::Raw(Raw&& o) noexcept : fd_(std::exchange(o.fd_, -1)), saved_(std::move(o.saved_)) {}
+Tty::~Tty() {
+    if (!s_) return;
+    (void)write("\x1b[?2004l");
+    ::SetConsoleMode(s_->in, s_->in_mode);
+    ::SetConsoleMode(s_->out, s_->out_mode);
+    ::SetConsoleCP(s_->in_cp);
+    ::SetConsoleOutputCP(s_->out_cp);
+    ::CloseHandle(s_->in);
+    ::CloseHandle(s_->out);
+}
 
-auto Raw::enter(int fd) -> Result<Raw> {
-    if (!::isatty(fd)) return fail("not a terminal");
-    Raw r(fd);
-    if (::tcgetattr(fd, &r.saved_->t) < 0) return fail("tcgetattr: {}", errno_str());
-    termios t = r.saved_->t;
+auto Tty::read(std::span<std::byte> out, Millis timeout) -> Result<std::size_t> {
+    // Console input is a queue of records; wait, then pull the UTF-8 bytes VT mode produces.
+    if (::WaitForSingleObject(s_->in, static_cast<DWORD>(std::min<long long>(timeout.count(), 0x7FFFFFFF))) != WAIT_OBJECT_0)
+        return fail("timed out");
+    DWORD n = 0;
+    if (!::ReadFile(s_->in, out.data(), static_cast<DWORD>(out.size()), &n, nullptr)) return fail("console read failed");
+    return static_cast<std::size_t>(n);
+}
+
+auto Tty::write(std::string_view s) -> Result<void> {
+    while (!s.empty()) {
+        DWORD n = 0;
+        if (!::WriteFile(s_->out, s.data(), static_cast<DWORD>(s.size()), &n, nullptr)) return fail("console write failed");
+        s.remove_prefix(n);
+    }
+    return {};
+}
+
+auto Tty::size() const -> std::pair<int, int> {
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (::GetConsoleScreenBufferInfo(s_->out, &info))
+        return {info.srWindow.Right - info.srWindow.Left + 1, info.srWindow.Bottom - info.srWindow.Top + 1};
+    return {80, 24};
+}
+
+auto Tty::in_fd() const -> int { return -1; }
+auto Tty::out_fd() const -> int { return -1; }
+
+#else
+
+struct Tty::State {
+    int fd = -1;
+    termios saved{};
+};
+
+auto Tty::open() -> Result<Tty> {
+    auto s = std::make_unique<State>();
+    s->fd = ::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (s->fd < 0) return fail("no terminal: {}", errno_str());
+    if (::tcgetattr(s->fd, &s->saved) < 0) {
+        ::close(s->fd);
+        return fail("tcgetattr: {}", errno_str());
+    }
+    termios t = s->saved;
     // IXON off so Ctrl+S/Ctrl+Q reach us; IEXTEN off so Ctrl+V isn't eaten as "literal next".
     t.c_iflag &= ~static_cast<tcflag_t>(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     t.c_oflag &= ~static_cast<tcflag_t>(OPOST);
@@ -27,22 +111,41 @@ auto Raw::enter(int fd) -> Result<Raw> {
     t.c_lflag &= ~static_cast<tcflag_t>(ECHO | ICANON | IEXTEN | ISIG);
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    if (::tcsetattr(fd, TCSAFLUSH, &t) < 0) return fail("tcsetattr: {}", errno_str());
-    (void)write_all(fd, as_view("\x1b[?2004h"), Millis(500));
-    return r;
+    if (::tcsetattr(s->fd, TCSAFLUSH, &t) < 0) {
+        ::close(s->fd);
+        return fail("tcsetattr: {}", errno_str());
+    }
+    Tty tty(std::move(s));
+    (void)tty.write("\x1b[?2004h");
+    return tty;
 }
 
-Raw::~Raw() {
-    if (fd_ < 0 || !saved_) return;
-    (void)write_all(fd_, as_view("\x1b[?2004l"), Millis(500));
-    ::tcsetattr(fd_, TCSAFLUSH, &saved_->t);
+Tty::~Tty() {
+    if (!s_) return;
+    (void)write("\x1b[?2004l");
+    ::tcsetattr(s_->fd, TCSAFLUSH, &s_->saved);
+    ::close(s_->fd);
 }
 
-auto size(int fd) -> std::pair<int, int> {
+auto Tty::read(std::span<std::byte> out, Millis timeout) -> Result<std::size_t> {
+    return read_some(s_->fd, out, timeout);
+}
+
+auto Tty::write(std::string_view s) -> Result<void> { return write_all(s_->fd, as_view(s), Millis(2000)); }
+
+auto Tty::size() const -> std::pair<int, int> {
     winsize ws{};
-    if (::ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return {ws.ws_col, ws.ws_row};
+    if (::ioctl(s_->fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return {ws.ws_col, ws.ws_row};
     return {80, 24};
 }
+
+auto Tty::in_fd() const -> int { return s_->fd; }
+auto Tty::out_fd() const -> int { return s_->fd; }
+
+#endif
+
+Tty::Tty(std::unique_ptr<State> s) : s_(std::move(s)) {}
+Tty::Tty(Tty&& o) noexcept : s_(std::move(o.s_)) {}
 
 void Parser::feed(ByteView bytes) { buf_ += as_string(bytes); }
 
@@ -101,7 +204,17 @@ auto Parser::next() -> std::optional<Key> {
             if (seq == "\x1b[13;2u" || seq == "\x1b[13;3u" || seq == "\x1b[27;2;13~") return key::AltEnter{};
             // kitty/xterm "CSI 118;5u" is Ctrl+V when the terminal sends key codes.
             if (seq == "\x1b[118;5u") return key::Ctrl{'v'};
+            if (seq == "\x1b[118;3u") return key::Alt{'v'};
             return next();  // ignore anything else
+        }
+        auto c1 = static_cast<unsigned char>(buf_[1]);
+        if (c1 >= 'a' && c1 <= 'z') {
+            take(2);
+            return key::Alt{static_cast<char>(c1)};
+        }
+        if (c1 >= 'A' && c1 <= 'Z') {
+            take(2);
+            return key::Alt{static_cast<char>(c1 - 'A' + 'a')};
         }
         take(1);
         return key::Escape{};

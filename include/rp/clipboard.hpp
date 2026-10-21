@@ -33,6 +33,12 @@ auto read(const std::string& socket_path, std::uint64_t max_bytes) -> Result<std
 namespace x11 {
 auto read(const std::string& display, std::uint64_t max_bytes) -> Result<std::vector<Item>>;
 }
+namespace win {
+auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>>;
+}
+namespace mac {
+auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>>;
+}
 
 // file:// URI list -> local paths. Skips anything that isn't a local file URI.
 auto parse_uri_list(std::string_view list) -> std::vector<std::string>;

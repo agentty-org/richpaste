@@ -181,4 +181,53 @@ auto human_size(std::uint64_t n) -> std::string {
     return u == 0 ? std::format("{} B", n) : std::format("{:.1f} {}", v, units[u]);
 }
 
+auto base64_encode(ByteView data) -> std::string {
+    constexpr char abc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    std::size_t i = 0;
+    auto at = [&](std::size_t k) { return std::to_integer<std::uint32_t>(data[k]); };
+    for (; i + 3 <= data.size(); i += 3) {
+        auto v = (at(i) << 16) | (at(i + 1) << 8) | at(i + 2);
+        out += abc[v >> 18];
+        out += abc[(v >> 12) & 63];
+        out += abc[(v >> 6) & 63];
+        out += abc[v & 63];
+    }
+    if (auto rest = data.size() - i; rest > 0) {
+        auto v = at(i) << 16 | (rest == 2 ? at(i + 1) << 8 : 0);
+        out += abc[v >> 18];
+        out += abc[(v >> 12) & 63];
+        out += rest == 2 ? abc[(v >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+auto base64_decode(std::string_view s) -> Result<Bytes> {
+    if (s.size() % 4 != 0) return fail("base64 length is not a multiple of 4");
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    Bytes out;
+    out.reserve(s.size() / 4 * 3);
+    for (std::size_t i = 0; i < s.size(); i += 4) {
+        bool last = i + 4 == s.size();
+        int a = val(s[i]), b = val(s[i + 1]);
+        int c = s[i + 2] == '=' && last ? -2 : val(s[i + 2]);
+        int d = s[i + 3] == '=' && last ? -2 : val(s[i + 3]);
+        if (a < 0 || b < 0 || c == -1 || d == -1 || (c == -2 && d != -2)) return fail("invalid base64");
+        auto v = static_cast<std::uint32_t>(a << 18 | b << 12 | (c < 0 ? 0 : c) << 6 | (d < 0 ? 0 : d));
+        out.push_back(static_cast<std::byte>(v >> 16));
+        if (c >= 0) out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+        if (d >= 0) out.push_back(static_cast<std::byte>(v & 0xFF));
+    }
+    return out;
+}
+
 }  // namespace rp

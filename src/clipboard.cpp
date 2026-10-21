@@ -2,7 +2,11 @@
 #include "rp/io.hpp"
 
 #include <algorithm>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace rp {
 
@@ -139,6 +143,19 @@ auto has_display_env() -> bool { return env("WAYLAND_DISPLAY") || env("DISPLAY")
 
 auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
     if (env("RICHPASTE_NO_DISPLAY")) return fail("no display server found (RICHPASTE_NO_DISPLAY is set)");
+#if defined(_WIN32)
+    auto r = win::read(max_bytes);
+    if (!r) return std::unexpected(r.error());
+    return Clip{std::move(*r), "windows"};
+#elif defined(__APPLE__)
+    // An ssh login on a Mac has no GUI session; the pasteboard is still reachable.
+    if (!env("DISPLAY")) {
+        auto r = mac::read(max_bytes);
+        if (!r) return std::unexpected(r.error());
+        return Clip{std::move(*r), "macos"};
+    }
+#endif
+#if !defined(_WIN32)
     std::vector<std::string> errors;
 
     // Wayland sockets: $WAYLAND_DISPLAY first, then any wayland-* in the runtime dir.
@@ -189,6 +206,7 @@ auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
     std::string all;
     for (auto& e : errors) all += (all.empty() ? "" : "; ") + e;
     return fail("{}", all);
+#endif
 }
 
 }  // namespace rp

@@ -2,6 +2,8 @@
 
 #include "rp/clipboard.hpp"
 #include "rp/composer.hpp"
+#include "rp/image.hpp"
+#include "rp/inband.hpp"
 #include "rp/sha256.hpp"
 #include "rp/term.hpp"
 #include "rp/wire.hpp"
@@ -59,11 +61,11 @@ void test_types() {
 }
 
 void test_wire() {
-    auto req = wire::encode_request({wire::Op::clipboard, 1234, 2});
-    check(req.size() == wire::request_size, "request size");
+    auto req = wire::encode_request({wire::Op::clipboard, 1234, 2, "tok"});
+    check(req.size() == wire::request_head + 3, "request size");
     auto back = wire::decode_request(req);
-    check(back && back->max_total_bytes == 1234 && back->hops == 2, "request roundtrip");
-    auto loop = wire::encode_request({wire::Op::clipboard, 1, 99});
+    check(back && back->max_total_bytes == 1234 && back->hops == 2 && back->token == "tok", "request roundtrip");
+    auto loop = wire::encode_request({wire::Op::clipboard, 1, 99, ""});
     check(!wire::decode_request(loop), "request rejects hop loop");
 
     Bytes png = {std::byte{0x89}, std::byte{'P'}, std::byte{'N'}, std::byte{'G'}, std::byte{0}, std::byte{0xFF}};
@@ -205,6 +207,99 @@ void test_parser() {
     e.feed(as_view("\x1b"));
     check(!e.next(), "lone esc waits");
     check(e.flush_escape().has_value(), "lone esc flushes");
+
+    term::Parser a;
+    a.feed(as_view("\x1bv\x1b[118;3u"));
+    auto ka = a.next();
+    check(ka && std::get<term::key::Alt>(*ka).letter == 'v', "alt+v as ESC v");
+    auto kb = a.next();
+    check(kb && std::get<term::key::Alt>(*kb).letter == 'v', "alt+v as CSI u");
+}
+
+void test_base64() {
+    check(base64_encode(as_view("")) == "", "b64 empty");
+    check(base64_encode(as_view("f")) == "Zg==", "b64 f");
+    check(base64_encode(as_view("fo")) == "Zm8=", "b64 fo");
+    check(base64_encode(as_view("foobar")) == "Zm9vYmFy", "b64 foobar");
+    check(as_string(*base64_decode("Zm9vYg==")) == "foob", "b64 decode padded");
+    check(!base64_decode("Zm9vYg"), "b64 rejects missing padding");
+    check(!base64_decode("Zm9v\nYmFy"), "b64 rejects whitespace");
+    check(!base64_decode("Zg==Zg=="), "b64 rejects padding in the middle");
+    Bytes all(256);
+    for (int i = 0; i < 256; ++i) all[static_cast<std::size_t>(i)] = std::byte(i);
+    check(*base64_decode(base64_encode(all)) == all, "b64 roundtrip all bytes");
+    check(hex(hmac_sha256(as_view("key"), as_view("The quick brown fox jumps over the lazy dog"))) ==
+              "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+          "hmac-sha256");
+}
+
+void test_inband() {
+    auto p = inband::parse_5522("type=read:status=DATA:mime=aW1hZ2UvcG5n;AAEC");
+    check(p && p->status == "DATA" && p->mime == "image/png" && p->data.size() == 3, "5522 DATA parsed");
+    check(!inband::parse_5522("type=read:status=DATA:mime=@@;AAEC"), "5522 bad mime rejected");
+
+    inband::ReadReply list;
+    (void)list.add(*inband::parse_5522("type=read:status=OK"), 1 << 20);
+    (void)list.add(*inband::parse_5522("type=read:status=DATA:mime=Lg==;" + base64_encode(as_view("text/plain\nimage/png\n"))), 1 << 20);
+    auto done = list.add(*inband::parse_5522("type=read:status=DONE"), 1 << 20);
+    check(done && *done, "5522 listing done");
+    auto mimes = list.mimes();
+    check(mimes.size() == 2 && mimes[1] == "image/png", "5522 listing mimes");
+    auto want = inband::choose_mimes(mimes);
+    check(want.size() == 1 && want[0] == "image/png", "5522 prefers image");
+
+    inband::ReadReply data;
+    Bytes img(10000);
+    for (std::size_t i = 0; i < img.size(); ++i) img[i] = std::byte(i * 7);
+    for (std::size_t off = 0; off < img.size(); off += 4096) {
+        auto chunk = ByteView(img).subspan(off, std::min<std::size_t>(4096, img.size() - off));
+        (void)data.add(*inband::parse_5522("type=read:status=DATA:mime=aW1hZ2UvcG5n;" + base64_encode(chunk)), 1 << 20);
+    }
+    (void)data.add(*inband::parse_5522("type=read:status=DONE"), 1 << 20);
+    auto items = data.items();
+    check(items && std::get<Image>((*items)[0]).data == img, "5522 chunks join into one image");
+
+    inband::ReadReply small;
+    auto big = small.add(*inband::parse_5522("type=read:status=DATA:mime=aW1hZ2UvcG5n;" + base64_encode(img)), 100);
+    check(!big, "5522 size limit enforced");
+    inband::ReadReply perm;
+    check(!perm.add(*inband::parse_5522("type=read:status=EPERM"), 1), "5522 EPERM is an error");
+
+    check(inband::tmux_wrap("\x1b]52;c;?\x07") == "\x1bPtmux;\x1b\x1b]52;c;?\x07\x1b\\", "tmux wrap doubles ESC");
+}
+
+void test_image() {
+    check(image::crc32(as_view("123456789")) == 0xCBF43926, "crc32 check value");
+    check(image::adler32(as_view("Wikipedia")) == 0x11E60398, "adler32 check value");
+
+    // 24-bit bottom-up 2x2 DIB: row0 (bottom) = blue, green; row1 (top) = red, white.
+    Bytes dib(40 + 2 * 8);
+    auto put32 = [&](std::size_t o, std::uint32_t v) { for (int i = 0; i < 4; ++i) dib[o + i] = std::byte(v >> (8 * i)); };
+    put32(0, 40);
+    put32(4, 2);
+    put32(8, 2);
+    dib[12] = std::byte{1};
+    dib[14] = std::byte{24};
+    std::uint8_t px[] = {255, 0, 0, 0, 255, 0, 0, 0, /* bottom: blue, green */ 0, 0, 255, 255, 255, 255, 0, 0};
+    for (std::size_t i = 0; i < 16; ++i) dib[40 + i] = std::byte{px[i]};
+    auto img = image::decode_dib(dib);
+    check(img && img->width == 2 && img->height == 2, "dib decoded");
+    if (img) {
+        auto at = [&](std::size_t i) { return std::to_integer<int>(img->pixels[i]); };
+        check(at(0) == 255 && at(1) == 0 && at(2) == 0 && at(3) == 255, "dib top-left is red");
+        check(at(12) == 0 && at(13) == 255 && at(14) == 0, "dib bottom-right is green");
+        auto png = image::encode_png(*img);
+        check(png.size() > 50 && png[1] == std::byte{'P'}, "png encoded");
+    }
+    check(!image::decode_dib(ByteView(dib).first(50)), "truncated dib rejected");
+}
+
+void test_deflate_roundtrip_shape() {
+    // A highly repetitive input must compress well (proves matches are emitted).
+    Bytes rep(200000, std::byte{'a'});
+    auto z = image::zlib_compress(rep);
+    check(z.size() < 2000, "deflate compresses repeats");
+    check(z[0] == std::byte{0x78}, "zlib header");
 }
 
 }  // namespace
@@ -216,6 +311,10 @@ int main() {
     test_choose();
     test_composer();
     test_parser();
+    test_base64();
+    test_inband();
+    test_image();
+    test_deflate_roundtrip_shape();
     if (failures) {
         std::println("{} check(s) failed", failures);
         return 1;

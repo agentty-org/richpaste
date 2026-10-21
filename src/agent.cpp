@@ -1,19 +1,18 @@
 #include "rp/agent.hpp"
 
+#include "rp/inband.hpp"
+#include "rp/sha256.hpp"
 #include "rp/wire.hpp"
 
 #include <algorithm>
-#include <atomic>
-#include <csignal>
+#include <charconv>
 #include <cstdio>
-#include <fcntl.h>
 #include <print>
-#include <sys/file.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <thread>
+#ifndef _WIN32
+#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace rp {
 
@@ -21,24 +20,23 @@ namespace fs = std::filesystem;
 
 namespace {
 
-auto ensure_private_dir(const fs::path& p) -> Result<void> {
-    std::error_code ec;
-    fs::create_directories(p, ec);
-    if (ec) return fail("create {}: {}", p.string(), ec.message());
-    ::chmod(p.c_str(), 0700);
-    return {};
-}
+[[maybe_unused]] auto tcp_info_path() -> fs::path { return state_dir() / "agent.tcp"; }
 
 // Only trust sockets that are real sockets owned by us (not symlinks, not planted by others).
-auto ours(const fs::path& p) -> bool {
+[[maybe_unused]] auto ours(const fs::path& p) -> bool {
+#ifdef _WIN32
+    (void)p;
+    return false;
+#else
     struct stat st{};
     return ::lstat(p.c_str(), &st) == 0 && S_ISSOCK(st.st_mode) && st.st_uid == ::getuid();
+#endif
 }
 
-auto mtime(const fs::path& p) -> std::int64_t {
-    struct stat st{};
-    if (::lstat(p.c_str(), &st) != 0) return 0;
-    return static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec;
+[[maybe_unused]] auto mtime(const fs::path& p) -> std::int64_t {
+    std::error_code ec;
+    auto t = fs::last_write_time(p, ec);
+    return ec ? 0 : static_cast<std::int64_t>(t.time_since_epoch().count());
 }
 
 auto encode_clip(const Result<Clip>& clip, std::uint64_t max) -> Bytes {
@@ -58,28 +56,34 @@ auto summary(const std::vector<Item>& items) -> std::string {
     return s.empty() ? "nothing" : s;
 }
 
-auto fetch_hops(const fs::path& socket, std::uint64_t max, std::uint32_t hops) -> Result<std::vector<Item>> {
-    auto fd = unix_connect(socket);
-    if (!fd) return std::unexpected(fd.error());
-    auto req = wire::encode_request({wire::Op::clipboard, max, hops});
-    if (auto w = write_all(fd->get(), req, Millis(5000)); !w) return fail("sending request: {}", w.error().what);
-    // Idle timeout covers the agent reading the clipboard and slow links.
-    auto resp = read_all(fd->get(), static_cast<std::size_t>(max) + (1u << 20), Millis(30000));
-    if (!resp) return fail("reading reply: {}", resp.error().what);
-    if (resp->empty()) return fail("agent on your machine isn't running (forward closed with no reply)");
-    return wire::decode_response(*resp);
+auto connect(const Endpoint& e) -> Result<Fd> {
+    return std::visit(overloaded{
+                          [](const UnixEndpoint& u) { return unix_connect(u.path); },
+                          [](const TcpEndpoint& t) { return tcp_connect_loopback(t.port); },
+                      },
+                      e);
 }
 
-// Are we inside an SSH session? Asks tmux too, since panes keep stale env.
+auto token_of(const Endpoint& e) -> std::string {
+    if (auto* t = std::get_if<TcpEndpoint>(&e)) return t->token;
+    // A forwarded unix socket may end at a Windows agent that wants a token.
+    return env("RICHPASTE_TOKEN").value_or("");
+}
+
+// Errors that mean "nobody is listening there", as opposed to a real answer.
+auto unreachable(const Error& e) -> bool {
+    auto& w = e.what;
+    return w.starts_with("connect") || w.starts_with("sending") || w.starts_with("reading reply") ||
+           w.starts_with("agent on your machine");
+}
+
+// Inside ssh? Asks tmux too, since an old pane keeps stale env.
 auto in_ssh_session() -> bool {
     if (env("TMUX")) {
-        if (FILE* p = ::popen("tmux show-environment SSH_CONNECTION 2>/dev/null", "r")) {
-            char buf[256] = {};
-            auto n = std::fread(buf, 1, sizeof(buf) - 1, p);
-            ::pclose(p);
-            std::string_view s(buf, n);
-            if (s.starts_with("SSH_CONNECTION=")) return true;
-            if (s.starts_with("-SSH_CONNECTION")) return false;
+        std::vector<std::string> cmd{"tmux", "show-environment", "SSH_CONNECTION"};
+        if (auto s = run_capture(cmd, Millis(1000))) {
+            if (s->starts_with("SSH_CONNECTION=")) return true;
+            if (s->starts_with("-SSH_CONNECTION")) return false;
         }
     }
     return env("SSH_CONNECTION") || env("SSH_TTY");
@@ -91,7 +95,7 @@ struct Attempt {
 
 auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::optional<Result<Clip>> {
     for (auto& s : find_forwarded_sockets()) {
-        auto r = fetch_hops(s, max, hops);
+        auto r = fetch(UnixEndpoint{s}, max, hops);
         if (r) return Clip{std::move(*r), "ssh " + s.filename().string()};
         // A dead forward leaves its socket file behind; clear it.
         if (r.error().what.contains("Connection refused")) {
@@ -100,9 +104,7 @@ auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::op
             continue;
         }
         // The agent answered with a real error (empty clipboard, too big). That's the answer.
-        if (!r.error().what.starts_with("connect") && !r.error().what.starts_with("sending") &&
-            !r.error().what.starts_with("reading reply") && !r.error().what.starts_with("agent on your machine"))
-            return std::unexpected(r.error());
+        if (!unreachable(r.error())) return std::unexpected(r.error());
         a.errors.push_back(std::format("{}: {}", s.filename().string(), r.error().what));
     }
     return std::nullopt;
@@ -118,43 +120,123 @@ auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> 
     return r;
 }
 
-auto paste_impl(std::uint64_t max, std::uint32_t hops, bool prefer_forwards) -> Result<Clip> {
+auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<Clip>> {
+    if (opt.tty_in < 0 || opt.tty_out < 0) return std::nullopt;
+    if (env("RICHPASTE_NO_TERMINAL")) return std::nullopt;
+    auto caps = inband::detect(opt.tty_in, opt.tty_out, Millis(1500));
+    inband::Session s{opt.tty_in, opt.tty_out, caps};
+    auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));
+    auto via = caps.osc5522 ? "terminal (OSC 5522)" : caps.tmux ? "terminal via tmux (OSC 52)" : "terminal (OSC 52)";
+    if (r) return Clip{std::move(*r), via};
+    // "Empty" and "refused" are answers; "didn't answer" means try nothing else here.
+    if (r.error().what.contains("didn't answer") || r.error().what.contains("did not answer")) {
+        a.errors.push_back(std::format("terminal{}: {}", caps.terminal.empty() ? "" : " " + caps.terminal, r.error().what));
+        return std::nullopt;
+    }
+    return std::unexpected(r.error());
+}
+
+auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forwards) -> Result<Clip> {
     if (auto s = env("RICHPASTE_SOCK")) {
-        auto r = fetch_hops(*s, max, hops);
+        auto r = fetch(UnixEndpoint{*s}, opt.max_bytes, hops);
         if (!r) return std::unexpected(r.error());
         return Clip{std::move(*r), "RICHPASTE_SOCK"};
     }
     Attempt a;
     if (prefer_forwards) {
-        if (auto r = from_forwards(max, hops, a)) return std::move(*r);
-        if (auto r = from_display(max, a)) return std::move(*r);
+        if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
+        // Over ssh, the terminal sits on the machine you type on, so ask it before
+        // reading whatever display the server happens to have.
+        if (auto r = from_terminal(opt, a)) return std::move(*r);
+        if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
     } else {
-        if (auto r = from_display(max, a)) return std::move(*r);
-        if (auto r = from_forwards(max, hops, a)) return std::move(*r);
+        if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
+        if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
+        if (auto r = from_terminal(opt, a)) return std::move(*r);
     }
     std::string why;
     for (auto& e : a.errors) why += "\n  " + e;
     return fail(
         "can't reach a clipboard.{}\n"
-        "If you are on ssh: run `richpaste setup` on the machine you type on, then reconnect.",
+        "Run `richpaste setup` on the machine you type on, then reconnect.",
         why);
 }
 
-std::atomic<bool> stop_flag = false;
+[[maybe_unused]] auto parse_tcp_info(std::string_view s) -> Result<TcpEndpoint> {
+    // "port token\n"
+    auto sp = s.find(' ');
+    if (sp == std::string_view::npos) return fail("bad agent.tcp");
+    unsigned port = 0;
+    auto ps = s.substr(0, sp);
+    auto [p, ec] = std::from_chars(ps.data(), ps.data() + ps.size(), port);
+    if (ec != std::errc{} || port == 0 || port > 65535) return fail("bad agent.tcp port");
+    auto tok = s.substr(sp + 1);
+    while (!tok.empty() && (tok.back() == '\n' || tok.back() == '\r' || tok.back() == ' ')) tok.remove_suffix(1);
+    if (tok.size() < 32) return fail("bad agent.tcp token");
+    return TcpEndpoint{static_cast<std::uint16_t>(port), std::string(tok)};
+}
+
+// Constant-time compare so the token can't be guessed byte by byte.
+auto same(std::string_view a, std::string_view b) -> bool {
+    if (a.size() != b.size()) return false;
+    unsigned char d = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) d |= static_cast<unsigned char>(a[i] ^ b[i]);
+    return d == 0;
+}
+
+auto serve_loop(Fd listener, Source source, std::string token, bool quiet) -> Result<void> {
+    for (;;) {
+        auto c = accept_one(listener.get(), Millis(1000));
+        if (!c) continue;
+        // One thread per paste so a slow link can't block other sessions.
+        std::thread([conn = std::move(*c), source, token, quiet]() mutable {
+            serve_one(conn.get(), source, token, quiet);
+        }).detach();
+    }
+}
 
 }  // namespace
 
 auto state_dir() -> fs::path { return home_dir() / ".richpaste"; }
-auto agent_socket_path() -> fs::path { return state_dir() / "agent.sock"; }
 auto ssh_forward_conf() -> fs::path { return state_dir() / "ssh"; }
 
-void serve_one(int fd, const Source& source, bool quiet) {
-    Bytes req(wire::request_size);
-    if (!read_exact(fd, req, Millis(5000))) return;
+auto local_endpoint() -> Result<Endpoint> {
+#ifdef _WIN32
+    auto b = read_file(tcp_info_path(), 4096);
+    if (!b) return fail("agent is not running");
+    auto t = parse_tcp_info(as_string(*b));
+    if (!t) return std::unexpected(t.error());
+    return Endpoint{*t};
+#else
+    return Endpoint{UnixEndpoint{state_dir() / "agent.sock"}};
+#endif
+}
+
+auto describe(const Endpoint& e) -> std::string {
+    return std::visit(overloaded{
+                          [](const UnixEndpoint& u) { return u.path.string(); },
+                          [](const TcpEndpoint& t) { return std::format("127.0.0.1:{}", t.port); },
+                      },
+                      e);
+}
+
+void serve_one(int fd, const Source& source, std::string_view token, bool quiet) {
+    Bytes head(wire::request_head);
+    if (!read_exact(fd, head, Millis(5000))) return;
+    auto tlen = std::to_integer<std::size_t>(head[head.size() - 2]) | std::to_integer<std::size_t>(head.back()) << 8;
+    if (tlen > wire::max_token) return;
+    Bytes req = head;
+    req.resize(head.size() + tlen);
+    if (tlen && !read_exact(fd, std::span(req).subspan(head.size()), Millis(5000))) return;
     auto r = wire::decode_request(req);
     Bytes out;
     if (!r) {
         out = wire::encode_error(r.error().what);
+    } else if (!token.empty() && !same(r->token, token) && !peer_is_same_user(fd)) {
+        // Windows: loopback TCP is open to every local user, so require the token
+        // unless the caller is this same Windows user (ssh.exe forwards run as you).
+        out = wire::encode_error("wrong agent token");
+        if (!quiet) std::println(stderr, "richpaste: refused a request with a wrong token");
     } else {
         auto clip = source(r->max_total_bytes, r->hops + 1);
         out = encode_clip(clip, r->max_total_bytes);
@@ -168,54 +250,52 @@ void serve_one(int fd, const Source& source, bool quiet) {
     (void)write_all(fd, out, Millis(30000));
 }
 
-auto run_agent(const fs::path& socket, Source source, bool quiet) -> Result<void> {
+auto run_agent_at(const fs::path& socket, Source source, bool quiet) -> Result<void> {
     if (auto d = ensure_private_dir(socket.parent_path()); !d) return d;
     auto lock_path = socket;
     lock_path += ".lock";
-    Fd lock(::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
-    if (!lock) return fail("open {}: {}", lock_path.string(), errno_str());
-    if (::flock(lock.get(), LOCK_EX | LOCK_NB) < 0) return fail("another agent is already running");
-
+    auto lock = FileLock::try_lock(lock_path);
+    if (!lock) return std::unexpected(lock.error());
     auto listener = unix_listen(socket);
     if (!listener) return std::unexpected(listener.error());
-    std::signal(SIGPIPE, SIG_IGN);
     if (!quiet) std::println(stderr, "richpaste: agent listening on {}", socket.string());
+    return serve_loop(std::move(*listener), std::move(source), {}, quiet);
+}
 
-    while (!stop_flag) {
-        if (!wait_readable(listener->get(), Millis(1000))) continue;
-        int c = ::accept4(listener->get(), nullptr, nullptr, SOCK_CLOEXEC);
-        if (c < 0) continue;
-        // One thread per paste so a slow link can't block other sessions.
-        std::thread([c, source, quiet] {
-            Fd conn(c);
-            serve_one(conn.get(), source, quiet);
-        }).detach();
-    }
-    return {};
+auto run_agent(Source source, bool quiet) -> Result<void> {
+#ifdef _WIN32
+    if (auto d = ensure_private_dir(state_dir()); !d) return d;
+    auto lock = FileLock::try_lock(state_dir() / "agent.lock");
+    if (!lock) return std::unexpected(lock.error());
+    // A fixed port lets ssh's RemoteForward line stay the same; fall back to any port.
+    std::uint16_t want = 47233;
+    if (auto p = env("RICHPASTE_PORT")) want = static_cast<std::uint16_t>(std::stoi(*p));
+    auto l = tcp_listen_loopback(want);
+    if (!l) l = tcp_listen_loopback(0);
+    if (!l) return std::unexpected(l.error());
+    auto token = random_hex(24);
+    auto info = std::format("{} {}\n", l->second, token);
+    if (auto w = write_file_atomic(tcp_info_path(), as_view(info)); !w) return w;
+    if (!quiet) std::println(stderr, "richpaste: agent listening on 127.0.0.1:{}", l->second);
+    return serve_loop(std::move(l->first), std::move(source), token, quiet);
+#else
+    return run_agent_at(state_dir() / "agent.sock", std::move(source), quiet);
+#endif
+}
+
+auto agent_alive() -> bool {
+    auto e = local_endpoint();
+    return e && connect(*e).has_value();
 }
 
 auto ensure_agent(const fs::path& self_exe) -> Result<void> {
-    if (unix_connect(agent_socket_path())) return {};
-    pid_t pid = ::fork();
-    if (pid < 0) return fail("fork: {}", errno_str());
-    if (pid == 0) {
-        ::setsid();
-        if (::fork() != 0) ::_exit(0);
-        int null = ::open("/dev/null", O_RDWR);
-        ::dup2(null, 0);
-        ::dup2(null, 1);
-        auto log = (state_dir() / "agent.log").string();
-        int lf = ::open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-        ::dup2(lf >= 0 ? lf : null, 2);
-        for (int fd = 3; fd < 256; ++fd) ::close(fd);
-        ::execl(self_exe.c_str(), self_exe.c_str(), "agent", static_cast<char*>(nullptr));
-        ::_exit(127);
-    }
-    int status = 0;
-    ::waitpid(pid, &status, 0);
+    if (agent_alive()) return {};
+    if (auto d = ensure_private_dir(state_dir()); !d) return d;
+    std::vector<std::string> args{"agent"};
+    if (auto s = spawn_detached(self_exe, args, state_dir() / "agent.log"); !s) return s;
     // Give it a moment so the very first paste doesn't race the bind.
-    for (int i = 0; i < 50; ++i) {
-        if (unix_connect(agent_socket_path())) return {};
+    for (int i = 0; i < 100; ++i) {
+        if (agent_alive()) return {};
         std::this_thread::sleep_for(Millis(10));
     }
     return {};
@@ -223,6 +303,7 @@ auto ensure_agent(const fs::path& self_exe) -> Result<void> {
 
 auto find_forwarded_sockets() -> std::vector<fs::path> {
     std::vector<fs::path> out;
+#ifndef _WIN32
     auto prefix = std::format("{}{}-", forward_prefix, user_name());
     std::error_code ec;
     for (auto& e : fs::directory_iterator("/tmp", ec)) {
@@ -230,36 +311,64 @@ auto find_forwarded_sockets() -> std::vector<fs::path> {
         if (name.starts_with(prefix) && name.ends_with(".sock") && ours(e.path())) out.push_back(e.path());
     }
     std::ranges::sort(out, std::greater{}, mtime);
+#endif
     return out;
 }
 
-auto fetch(const fs::path& socket, std::uint64_t max_bytes) -> Result<std::vector<Item>> {
-    return fetch_hops(socket, max_bytes, 0);
+auto fetch(const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<std::vector<Item>> {
+    auto fd = connect(e);
+    if (!fd) return std::unexpected(fd.error());
+    auto req = wire::encode_request({wire::Op::clipboard, max, hops, token_of(e)});
+    if (auto w = write_all(fd->get(), req, Millis(5000)); !w) return fail("sending request: {}", w.error().what);
+    // Idle timeout covers the agent reading the clipboard and slow links.
+    auto resp = read_all(fd->get(), static_cast<std::size_t>(max) + (1u << 20), Millis(30000));
+    if (!resp) return fail("reading reply: {}", resp.error().what);
+    if (resp->empty()) return fail("agent on your machine isn't running (forward closed with no reply)");
+    return wire::decode_response(*resp);
 }
 
-auto paste(std::uint64_t max_bytes) -> Result<Clip> { return paste_impl(max_bytes, 0, in_ssh_session()); }
+auto paste(const PasteOptions& opt) -> Result<Clip> { return paste_impl(opt, 0, in_ssh_session()); }
 
 // The agent reads its own display first, and relays to the next hop if it has none.
 auto agent_source() -> Source {
-    return [](std::uint64_t max, std::uint32_t hops) { return paste_impl(max, hops, false); };
+    return [](std::uint64_t max, std::uint32_t hops) {
+        PasteOptions o;
+        o.max_bytes = max;
+        return paste_impl(o, hops, false);
+    };
 }
 
 auto ssh_hook(const fs::path& self_exe) -> Result<void> {
     if (auto d = ensure_private_dir(ssh_forward_conf()); !d) return d;
     if (auto a = ensure_agent(self_exe); !a) return a;
+    auto e = local_endpoint();
+    if (!e) return std::unexpected(e.error());
     // A fresh name per connection, so old sockets left on the server never block the bind.
-    auto line = std::format("RemoteForward /tmp/{}%r-{}.sock {}\n", forward_prefix, random_hex(8),
-                            agent_socket_path().string());
+    // The remote end is always a unix socket in /tmp; the local end is ours.
+    auto remote = std::format("/tmp/{}%r-{}.sock", forward_prefix, random_hex(8));
+    auto local = std::visit(overloaded{
+                                [](const UnixEndpoint& u) { return u.path.string(); },
+                                [](const TcpEndpoint& t) { return std::format("127.0.0.1:{}", t.port); },
+                            },
+                            *e);
+    auto line = std::format("RemoteForward {} {}\n", remote, local);
     return write_file_atomic(ssh_forward_conf() / "forward.conf", as_view(line));
 }
 
 auto ssh_config_snippet(const fs::path& self_exe) -> std::string {
+    auto exe = self_exe.string();
+    auto conf = (ssh_forward_conf() / "forward.conf").string();
+#ifdef _WIN32
+    // OpenSSH for Windows runs Match exec through cmd.exe and wants forward slashes.
+    std::ranges::replace(exe, '\\', '/');
+    std::ranges::replace(conf, '\\', '/');
+#endif
     return std::format(
         "# richpaste: forward your clipboard to every ssh session\n"
-        "Match !host github.com,gitlab.com,bitbucket.org,ssh.dev.azure.com exec \"{} ssh-hook\"\n"
-        "  Include {}\n"
+        "Match !host github.com,gitlab.com,bitbucket.org,ssh.dev.azure.com exec \"\\\"{}\\\" ssh-hook\"\n"
+        "  Include \"{}\"\n"
         "# richpaste end\n",
-        self_exe.string(), (ssh_forward_conf() / "forward.conf").string());
+        exe, conf);
 }
 
 }  // namespace rp

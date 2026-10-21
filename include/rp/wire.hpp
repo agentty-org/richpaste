@@ -3,7 +3,7 @@
 // Wire format between the remote app and the clipboard agent on your machine.
 // Everything is little-endian. One request, one response, then the connection closes.
 //
-//   request:  "RPQ1" u32 op  u64 max_total_bytes  u32 hops
+//   request:  "RPQ1" u32 op  u64 max_total_bytes  u32 hops  str16 token
 //   response: "RPA1" u8 status
 //             status 0: u32 count, then count items:
 //                       u8 kind  str16 mime  str16 name  u64 size  bytes[size]  sha256[32]
@@ -22,7 +22,9 @@ inline constexpr std::string_view request_magic = "RPQ1";
 inline constexpr std::string_view response_magic = "RPA1";
 inline constexpr std::uint32_t max_items = 4096;
 inline constexpr std::uint32_t max_hops = 8;
-inline constexpr std::size_t request_size = 4 + 4 + 8 + 4;
+// Fixed part of a request; the token's length is the last u16.
+inline constexpr std::size_t request_head = 4 + 4 + 8 + 4 + 2;
+inline constexpr std::size_t max_token = 64;
 
 enum class Op : std::uint32_t { clipboard = 1 };
 
@@ -30,6 +32,7 @@ struct Request {
     Op op = Op::clipboard;
     std::uint64_t max_total_bytes = 0;
     std::uint32_t hops = 0;  // how many agents already relayed this
+    std::string token;       // required by agents that listen on TCP
 };
 
 class Writer {

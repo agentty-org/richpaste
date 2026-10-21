@@ -25,6 +25,7 @@ private:
 };
 
 auto sha256(std::span<const std::byte> data) -> Digest;
+auto hmac_sha256(std::span<const std::byte> key, std::span<const std::byte> msg) -> Digest;
 auto hex(std::span<const std::byte> data) -> std::string;
 
 }  // namespace rp
