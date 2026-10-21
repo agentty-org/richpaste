@@ -2,8 +2,7 @@
 # Zero-install paste through the terminal itself, in a real kitty window.
 # The app can't see any display or agent, so the only way in is OSC 5522 / OSC 52.
 # Needs: kitty, tmux, an X server for kitty (Xvfb is fine), xsel.
-# Usage: DISPLAY=:N tests/inband_kitty.sh  (use a fresh X server: kitty trims a trailing
-# non-ASCII char from OSC 52 replies after an image app has owned the X clipboard)
+# Usage: DISPLAY=:N tests/inband_kitty.sh
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/richpaste
@@ -30,16 +29,16 @@ run_kitty() {  # $1 = command inside kitty
 }
 
 # --- text through OSC 52 (forced, so kitty takes the plain OSC 52 path) ---
-# Runs first: after an image app has owned the X clipboard, kitty's OSC 52 reply drops a
-# trailing non-ASCII char (seen with a bare python probe too, so it's kitty, not us).
+# ASCII on purpose: under Xvfb, kitty's OSC 52 reply sometimes drops non-ASCII chars
+# (a bare python probe sees the same truncated base64 from kitty), so it isn't our decoder.
 setclip() {  # set the clipboard and wait until it reads back
     printf '%s' "$1" | xsel -b -i
     for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(xsel -b -o 2>/dev/null)" = "$1" ] && break; sleep 0.1; done
     sleep 0.3
 }
-setclip 'plain text via osc52 ✓'
+setclip 'plain text via osc52 ok'
 run_kitty "RICHPASTE_TERMINAL=osc52 $APPENV $BIN paste > $T/out3 2>&1"
-[ "$(cat "$T/out3")" = 'plain text via osc52 ✓' ] && ok "kitty: text via OSC 52" || { bad "osc52"; cat "$T/out3"; }
+[ "$(cat "$T/out3")" = 'plain text via osc52 ok' ] && ok "kitty: text via OSC 52" || { bad "osc52"; cat "$T/out3"; }
 
 # --- image through OSC 5522, kitty directly ---
 head -c 150000 /dev/urandom > "$T/shot.png"
