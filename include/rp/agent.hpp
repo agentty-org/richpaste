@@ -9,6 +9,23 @@ namespace rp {
 
 inline constexpr std::uint64_t default_max_bytes = 256ull << 20;
 
+// How this program names and re-runs itself. An app that ships richpaste as a
+// subcommand sets this once at startup, before any thread, e.g.
+//   set_program({"agentty paste", {}, {"paste"}});
+// so messages say `agentty paste setup` and the agent and ssh hook run
+// `agentty paste agent` / `agentty paste ssh-hook`.
+struct Program {
+    std::string name = "richpaste";      // used in messages
+    std::filesystem::path exe;            // empty: this executable
+    std::vector<std::string> args;        // put before the subcommand
+    std::string default_command;          // run when no subcommand is given; empty: usage
+    std::filesystem::path state_dir;      // agent socket, log, saved pastes; empty: ~/.richpaste
+};
+void set_program(Program p);
+auto program() -> const Program&;
+// The command line that runs subcommand `sub` of this program.
+auto self_command(std::string_view sub) -> std::vector<std::string>;
+
 auto state_dir() -> std::filesystem::path;
 
 // How to reach an agent. Unix socket on Linux/macOS; loopback TCP + token on Windows.
@@ -40,7 +57,7 @@ auto run_agent_at(const std::filesystem::path& socket, Source source, bool quiet
 void serve_one(int fd, const Source& source, std::string_view token, bool quiet);
 
 // Starts the agent in the background if it isn't already answering.
-auto ensure_agent(const std::filesystem::path& self_exe) -> Result<void>;
+auto ensure_agent() -> Result<void>;
 auto agent_alive() -> bool;
 
 // ---- remote side ----
@@ -68,10 +85,14 @@ auto paste(const PasteOptions& opt = {}) -> Result<Clip>;
 
 // ---- ssh glue ----
 
+// Starts the agent if needed and returns a fresh {remote, local} pair for
+// `ssh -R remote:local` (the remote is a unix socket path with %r in it).
+auto remote_forward() -> Result<std::pair<std::string, std::string>>;
+
 // Called from ssh_config `Match exec`. Writes the forward line ssh will Include.
-auto ssh_hook(const std::filesystem::path& self_exe) -> Result<void>;
+auto ssh_hook() -> Result<void>;
 auto ssh_forward_conf() -> std::filesystem::path;
-auto ssh_config_snippet(const std::filesystem::path& self_exe) -> std::string;
+auto ssh_config_snippet() -> std::string;
 
 inline constexpr std::string_view forward_prefix = "richpaste-";
 

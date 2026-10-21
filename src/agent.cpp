@@ -157,8 +157,8 @@ auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forward
         for (auto& e : a.errors) why += "\n  " + e;
         return fail(
             "can't reach the clipboard on the machine you're typing on.{}\n"
-            "Run `richpaste setup` on that machine (your laptop), then reconnect.",
-            why);
+            "Run `{} setup` on that machine (your laptop), then reconnect.",
+            why, program().name);
     } else {
         if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
         if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
@@ -168,8 +168,8 @@ auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forward
     for (auto& e : a.errors) why += "\n  " + e;
     return fail(
         "can't reach a clipboard.{}\n"
-        "Run `richpaste setup` on the machine you type on, then reconnect.",
-        why);
+        "Run `{} setup` on the machine you type on, then reconnect.",
+        why, program().name);
 }
 
 [[maybe_unused]] auto parse_tcp_info(std::string_view s) -> Result<TcpEndpoint> {
@@ -207,7 +207,28 @@ auto serve_loop(Fd listener, Source source, std::string token, bool quiet) -> Re
 
 }  // namespace
 
-auto state_dir() -> fs::path { return home_dir() / ".richpaste"; }
+namespace {
+auto program_slot() -> Program& {
+    static Program p;
+    return p;
+}
+}  // namespace
+
+void set_program(Program p) { program_slot() = std::move(p); }
+auto program() -> const Program& { return program_slot(); }
+
+auto self_command(std::string_view sub) -> std::vector<std::string> {
+    auto& p = program();
+    std::vector<std::string> out{(p.exe.empty() ? self_exe() : p.exe).string()};
+    out.insert(out.end(), p.args.begin(), p.args.end());
+    out.emplace_back(sub);
+    return out;
+}
+
+auto state_dir() -> fs::path {
+    if (!program().state_dir.empty()) return program().state_dir;
+    return home_dir() / ".richpaste";
+}
 auto ssh_forward_conf() -> fs::path { return state_dir() / "ssh"; }
 
 auto local_endpoint() -> Result<Endpoint> {
@@ -252,9 +273,9 @@ void serve_one(int fd, const Source& source, std::string_view token, bool quiet)
         out = encode_clip(clip, r->max_total_bytes);
         if (!quiet) {
             if (clip)
-                std::println(stderr, "richpaste: served {} from {}", summary(clip->items), clip->source);
+                std::println(stderr, "{}: served {} from {}", program().name, summary(clip->items), clip->source);
             else
-                std::println(stderr, "richpaste: {}", clip.error().what);
+                std::println(stderr, "{}: {}", program().name, clip.error().what);
         }
     }
     (void)write_all(fd, out, Millis(30000));
@@ -268,7 +289,7 @@ auto run_agent_at(const fs::path& socket, Source source, bool quiet) -> Result<v
     if (!lock) return std::unexpected(lock.error());
     auto listener = unix_listen(socket);
     if (!listener) return std::unexpected(listener.error());
-    if (!quiet) std::println(stderr, "richpaste: agent listening on {}", socket.string());
+    if (!quiet) std::println(stderr, "{}: agent listening on {}", program().name, socket.string());
     return serve_loop(std::move(*listener), std::move(source), {}, quiet);
 }
 
@@ -286,7 +307,7 @@ auto run_agent(Source source, bool quiet) -> Result<void> {
     auto token = random_hex(24);
     auto info = std::format("{} {}\n", l->second, token);
     if (auto w = write_file_atomic(tcp_info_path(), as_view(info)); !w) return w;
-    if (!quiet) std::println(stderr, "richpaste: agent listening on 127.0.0.1:{}", l->second);
+    if (!quiet) std::println(stderr, "{}: agent listening on 127.0.0.1:{}", program().name, l->second);
     return serve_loop(std::move(l->first), std::move(source), token, quiet);
 #else
     return run_agent_at(state_dir() / "agent.sock", std::move(source), quiet);
@@ -298,11 +319,12 @@ auto agent_alive() -> bool {
     return e && connect(*e).has_value();
 }
 
-auto ensure_agent(const fs::path& self_exe) -> Result<void> {
+auto ensure_agent() -> Result<void> {
     if (agent_alive()) return {};
     if (auto d = ensure_private_dir(state_dir()); !d) return d;
-    std::vector<std::string> args{"agent"};
-    if (auto s = spawn_detached(self_exe, args, state_dir() / "agent.log"); !s) return s;
+    auto cmd = self_command("agent");
+    std::span<const std::string> args(cmd.begin() + 1, cmd.end());
+    if (auto s = spawn_detached(cmd.front(), args, state_dir() / "agent.log"); !s) return s;
     // Give it a moment so the very first paste doesn't race the bind.
     for (int i = 0; i < 100; ++i) {
         if (agent_alive()) return {};
@@ -356,9 +378,8 @@ auto agent_source() -> Source {
     };
 }
 
-auto ssh_hook(const fs::path& self_exe) -> Result<void> {
-    if (auto d = ensure_private_dir(ssh_forward_conf()); !d) return d;
-    if (auto a = ensure_agent(self_exe); !a) return a;
+auto remote_forward() -> Result<std::pair<std::string, std::string>> {
+    if (auto a = ensure_agent(); !a) return std::unexpected(a.error());
     auto e = local_endpoint();
     if (!e) return std::unexpected(e.error());
     // A fresh name per connection, so old sockets left on the server never block the bind.
@@ -369,24 +390,35 @@ auto ssh_hook(const fs::path& self_exe) -> Result<void> {
                                 [](const TcpEndpoint& t) { return std::format("127.0.0.1:{}", t.port); },
                             },
                             *e);
-    auto line = std::format("RemoteForward {} {}\n", remote, local);
+    return std::pair{remote, local};
+}
+
+auto ssh_hook() -> Result<void> {
+    if (auto d = ensure_private_dir(ssh_forward_conf()); !d) return d;
+    auto f = remote_forward();
+    if (!f) return std::unexpected(f.error());
+    auto line = std::format("RemoteForward {} {}\n", f->first, f->second);
     return write_file_atomic(ssh_forward_conf() / "forward.conf", as_view(line));
 }
 
-auto ssh_config_snippet(const fs::path& self_exe) -> std::string {
-    auto exe = self_exe.string();
+auto ssh_config_snippet() -> std::string {
+    auto cmd = self_command("ssh-hook");
+    auto exe = cmd.front();
     auto conf = (ssh_forward_conf() / "forward.conf").string();
 #ifdef _WIN32
     // OpenSSH for Windows runs Match exec through cmd.exe and wants forward slashes.
     std::ranges::replace(exe, '\\', '/');
     std::ranges::replace(conf, '\\', '/');
 #endif
+    // The exe is quoted; the rest are plain words like "paste" and "ssh-hook".
+    std::string line = "\\\"" + exe + "\\\"";
+    for (std::size_t i = 1; i < cmd.size(); ++i) line += " " + cmd[i];
     return std::format(
         "# richpaste: forward your clipboard to every ssh session\n"
-        "Match !host github.com,gitlab.com,bitbucket.org,ssh.dev.azure.com exec \"\\\"{}\\\" ssh-hook\"\n"
+        "Match !host github.com,gitlab.com,bitbucket.org,ssh.dev.azure.com exec \"{}\"\n"
         "  Include \"{}\"\n"
         "# richpaste end\n",
-        exe, conf);
+        line, conf);
 }
 
 }  // namespace rp

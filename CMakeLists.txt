@@ -10,10 +10,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(RICHPASTE_STATIC "Link fully static so one binary runs anywhere" OFF)
-option(RICHPASTE_TESTS "Build tests" ON)
+option(RICHPASTE_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
+option(RICHPASTE_TOOL "Build the richpaste executable" ${PROJECT_IS_TOP_LEVEL})
 
-add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
-if(RICHPASTE_STATIC)
+if(PROJECT_IS_TOP_LEVEL AND NOT MSVC)
+  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
+endif()
+if(RICHPASTE_STATIC AND PROJECT_IS_TOP_LEVEL)
   add_link_options(-static)
 endif()
 
@@ -35,15 +38,20 @@ add_library(rp STATIC
   src/agent.cpp
   src/composer.cpp
   src/term.cpp
+  src/cli.cpp
 )
 target_include_directories(rp PUBLIC include)
 if(WIN32)
   target_compile_definitions(rp PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00)
-  target_link_libraries(rp PUBLIC ws2_32 bcrypt shell32 iphlpapi advapi32)
+  target_link_libraries(rp PUBLIC ws2_32 bcrypt shell32 iphlpapi advapi32 user32)
 endif()
+find_package(Threads REQUIRED)
+target_link_libraries(rp PUBLIC Threads::Threads)
 
-add_executable(richpaste src/main.cpp)
-target_link_libraries(richpaste PRIVATE rp)
+if(RICHPASTE_TOOL)
+  add_executable(richpaste src/main.cpp)
+  target_link_libraries(richpaste PRIVATE rp)
+endif()
 
 if(RICHPASTE_TESTS)
   enable_testing()
