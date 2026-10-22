@@ -247,8 +247,7 @@ auto detect(Session& s, Millis timeout) -> Caps {
     }
     if (c.tmux) {
         // Let our wrapped escapes through for this pane only. Harmless if already on.
-        std::vector<std::string> cmd{"tmux", "set", "-p", "-t", *env("TMUX_PANE"), "allow-passthrough", "on"};
-        c.passthrough = run_capture(cmd, Millis(1000)).has_value();
+        c.passthrough = tmux_allow_passthrough();
     } else {
         c.terminal = env("TERM_PROGRAM").or_else([] { return env("TERM"); }).value_or("");
     }
@@ -329,6 +328,16 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
     return std::vector<Item>{Text::repair(text)};
 }
 
+auto tmux_allow_passthrough() -> bool {
+    auto pane = env("TMUX_PANE");
+    if (!env("TMUX") || !pane) return false;
+    // Leave `all` alone; only turn on what's off. Pane scope, so it ends with the pane.
+    std::vector<std::string> get{"tmux", "show", "-pqv", "-t", *pane, "allow-passthrough"};
+    if (auto v = run_capture(get, Millis(1000)); v && (v->starts_with("on") || v->starts_with("all"))) return true;
+    std::vector<std::string> cmd{"tmux", "set", "-p", "-t", *pane, "allow-passthrough", "on"};
+    return run_capture(cmd, Millis(1000)).has_value();
+}
+
 auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
     // tmux asks the outer terminal (OSC 52) and stores the answer as a new paste buffer.
     // Works with default tmux options; we wait for that buffer to show up.
@@ -371,6 +380,10 @@ auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
     }
     if (!run_capture(refresh, Millis(1000))) return fail("tmux refresh-client -l failed");
     auto deadline = std::chrono::steady_clock::now() + timeout;
+    // A big reply (an image line) is still streaming into tmux while we wait;
+    // while tmux's client input keeps growing, give it more time.
+    std::vector<std::string> activity{"tmux", "display", "-p", "#{client_activity}"};
+    auto last_activity = run_capture(activity, Millis(1000)).value_or("");
     while (std::chrono::steady_clock::now() < deadline) {
         auto now = newest();
         if (!now.second.empty() && now != before) {
@@ -390,8 +403,13 @@ auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
             return as_string(*bytes);
         }
         std::this_thread::sleep_for(Millis(50));
+        if (auto a = run_capture(activity, Millis(1000)).value_or(""); a != last_activity) {
+            last_activity = a;
+            deadline = std::max(deadline, std::chrono::steady_clock::now() + Millis(2000));
+        }
     }
-    return fail(Code::no_answer, "the terminal outside tmux didn't answer a clipboard read (OSC 52 reads are off or unsupported)");
+    return fail(Code::no_answer,
+                "your terminal didn't answer tmux's clipboard read (tmux needs `set -g set-clipboard on`, and the terminal must allow clipboard reads)");
 }
 
 namespace {

@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
     // agentty feeds Config from its settings; the shell tests drive it with env.
     Config c;
     if (env("RICHPASTE_NO_DISPLAY")) c.display = false;
+    if (env("RICHPASTE_NO_FORWARDS")) c.forwards = false;
     if (env("RICHPASTE_SERVER_CLIPBOARD")) c.server_display = true;
     if (env("RICHPASTE_NO_TERMINAL")) c.terminal = TerminalMode::off;
     if (auto t = env("RICHPASTE_TERMINAL")) c.terminal = *t == "5522" ? TerminalMode::osc5522 : TerminalMode::osc52;

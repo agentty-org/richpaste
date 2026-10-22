@@ -24,19 +24,29 @@ You copy a screenshot and press Ctrl+V. Nothing happens, because:
 ## Routes
 
 The terminal is only used for the keypress. richpaste then fetches the clipboard by
-the best route there is:
+the best route there is. Routes that need no setup come first, the ones that carry
+images before the ones that only carry text, and each that has nothing hands over
+to the next (`rp::plan`, a pure function, picks the order):
 
 | # | Route | Needs | Carries |
 |---|-------|-------|---------|
-| 1 | **ssh forward** to the agent on your machine | `agentty paste setup` once there | text, images, files |
-| 2 | **the terminal** (OSC 5522) | kitty-style terminal | text, images, files |
-| 3 | **the terminal** (OSC 52) | terminal that allows clipboard reads | text |
-| 4 | **this machine's display** | you're local | text, images, files |
+| 1 | **this machine's display** | you're local | text, images, files |
+| 2 | **ssh forward** to the agent on your machine | `agentty paste setup` once there (free to check otherwise) | text, images, files |
+| 3 | **the terminal** (OSC 5522) | kitty | text, images, files |
+| 3 | **the terminal** (OSC 52) | a terminal that allows clipboard reads (not inside tmux) | text |
+| 4 | **tmux's buffer** (`refresh-client -l`) | tmux with `set-clipboard on` | text, exact, no size cap |
 | 5 | **pasted as text** (`richpaste:1:` line) | a built-in helper on your machine | text, images, files |
 
-Inside ssh, 1 then 2/3. Locally, 4 first. Over ssh the server's own clipboard is never
-used, since it isn't the one you copied into. Whatever route a paste takes, a
-`richpaste:1:` line in it turns back into the image or file.
+Over ssh the server's own display is skipped (it isn't the one you copied into)
+unless you ask for it. Inside tmux, tmux says which terminal is outside: kitty is
+asked directly for images, other terminals' text comes through tmux's buffer, since
+an OSC 52 reply that crosses tmux into our input gets cut or re-encoded. A terminal
+that refuses skips the tmux route too (it would refuse tmux the same way). Whatever
+route a paste takes, a `richpaste:1:` line in it turns back into the image or file.
+
+Apps that read the terminal through their own input (agentty) drive the same walk
+with `rp::start` / `rp::advance` / `rp::skip`: richpaste runs every route it can and
+stops when the next one is "ask the terminal", saying which dialect to use.
 
 ```
 laptop                                              server

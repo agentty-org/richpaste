@@ -70,6 +70,11 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
 // Asks tmux to fetch the outer terminal's clipboard (OSC 52) and returns the text.
 auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string>;
 
+// Inside tmux, lets this pane's wrapped escapes reach the outer terminal
+// (`allow-passthrough on`, which is off by default). Apps that ask the
+// terminal through their own output call this first. True if tmux agreed.
+auto tmux_allow_passthrough() -> bool;
+
 // An OSC 5522 read reply that lost its ESC bytes on the way (some tmux / ssh
 // setups), so it reached the app as typed text: "]5522;type=read:status=DATA:..."
 enum class Stripped : std::uint8_t {

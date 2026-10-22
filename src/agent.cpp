@@ -114,17 +114,22 @@ auto tagged(Error e, Route r) -> Error {
 }
 
 // A failure that means "this route has nothing to say", so the next one is
-// tried. Anything else (empty, too big, refused, corrupt) is the answer.
+// tried. Anything else (too big, refused, corrupt) is the answer.
 auto moves_on(Route r, Code c) -> bool {
-    // tmux only fetches text (OSC 52) and can fail for its own reasons; the
-    // terminal may still answer, with an image even.
-    if (r == Route::tmux_buffer) return c != Code::too_big;
+    if (c == Code::too_big || c == Code::corrupt) return false;
+    // The terminal or tmux saying "empty" may only mean "no TEXT" (an image
+    // asked for over OSC 52), so a later route may still have it. The
+    // display or your laptop's agent saying it is the answer.
+    if (c == Code::empty) return r == Route::terminal || r == Route::tmux_buffer;
+    // A terminal that refuses reads may still let tmux fetch text.
+    if (c == Code::refused) return r == Route::terminal;
     switch (c) {
         case Code::unreachable:
         case Code::no_display:
         case Code::no_answer:
         case Code::needs_terminal:
-        case Code::no_route: return true;
+        case Code::no_route:
+        case Code::other: return true;
         default: return false;
     }
 }
@@ -177,53 +182,94 @@ auto from_tmux_buffer(const PasteOptions& opt) -> Result<Clip> {
     return Clip{{Text::repair(*t)}, "terminal via tmux buffer", Route::tmux_buffer};
 }
 
-auto from_terminal(const PasteOptions& opt) -> Result<Clip> {
+auto from_terminal(const PasteOptions& opt, Images images) -> Result<Clip> {
     if (!opt.terminal) return fail(Code::needs_terminal, "no terminal session to ask");
     inband::Session s = *opt.terminal;
     auto caps = inband::detect(s, Millis(1500));
+    // Inside tmux the outer terminal can't be asked DECRQM through the pane;
+    // what tmux says about it decides.
+    if (images == Images::yes) s.caps.osc5522 = caps.osc5522 = true;
+    if (images == Images::no && config().terminal == TerminalMode::automatic) s.caps.osc5522 = caps.osc5522 = false;
     auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));
     if (!r) return context(r.error(), caps.terminal.empty() ? "terminal" : "terminal " + caps.terminal);
     auto via = caps.osc5522 ? "terminal (OSC 5522)" : caps.tmux ? "terminal via tmux (OSC 52)" : "terminal (OSC 52)";
     return Clip{std::move(*r), via, Route::terminal};
 }
 
-auto try_route(Route r, const PasteOptions& opt, std::uint32_t hops) -> Result<Clip> {
+auto try_route(Route r, const PasteOptions& opt, std::uint32_t hops, Images images) -> Result<Clip> {
     switch (r) {
         case Route::socket: return from_socket(opt, hops);
         case Route::forward: return from_forwards(opt, hops);
         case Route::display: return from_display(opt);
         case Route::tmux_buffer: return from_tmux_buffer(opt);
-        case Route::terminal: return from_terminal(opt);
+        case Route::terminal: return from_terminal(opt, images);
     }
     return fail("unknown route");
 }
 
-auto walk(const std::vector<Route>& routes, const PasteOptions& opt, std::uint32_t hops, bool remote) -> Result<Clip> {
-    std::vector<Error> causes;
-    for (auto route : routes) {
-        auto r = try_route(route, opt, hops);
-        if (r) return r;
-        auto e = tagged(std::move(r.error()), route);
-        if (!moves_on(route, e.code)) return std::unexpected(std::move(e));
-        causes.push_back(std::move(e));
-    }
+// Every route had nothing: one error that lists them and says what to do.
+auto exhausted(Walk& w) -> Error {
     std::string why;
-    for (auto& e : causes) why += std::format("\n  {}: {}", route_name(*e.route), e.what);
-    // Only the terminal is left and we may not ask it: the caller can, through
-    // its own input.
-    const bool ask_terminal = std::ranges::any_of(causes, [](auto& e) { return e.code == Code::needs_terminal; });
-    Error out{ask_terminal ? Code::needs_terminal : Code::no_route, "", std::move(causes), {}};
-    out.what = remote ? std::format("can't reach the clipboard on the machine you're typing on.{}\n"
-                                    "Run `{} setup` on that machine (your laptop), then reconnect.",
-                                    why, program().name)
-                      : std::format("can't reach a clipboard.{}\nRun `{} setup` on the machine you type on, then reconnect.",
-                                    why, program().name);
-    return std::unexpected(std::move(out));
+    for (auto& e : w.causes) why += std::format("\n  {}: {}", route_name(*e.route), e.what);
+    const bool all_empty = !w.causes.empty() && std::ranges::all_of(w.causes, [](auto& e) {
+        return e.code == Code::empty || e.code == Code::no_display || e.code == Code::unreachable;
+    }) && std::ranges::any_of(w.causes, [](auto& e) { return e.code == Code::empty; });
+    // The terminal said no: that's the one thing to fix, so lead with it.
+    const auto* refused = [&]() -> const Error* {
+        for (auto& e : w.causes)
+            if (e.code == Code::refused) return &e;
+        return nullptr;
+    }();
+    if (refused) {
+        Error out{Code::refused, refused->what, std::move(w.causes), Route::terminal};
+        w.causes.clear();
+        return out;
+    }
+    Error out{all_empty ? Code::empty : Code::no_route, "", std::move(w.causes), {}};
+    w.causes.clear();
+    if (all_empty) out.what = "clipboard is empty";
+    else if (w.situation.ssh)
+        out.what = std::format("can't reach the clipboard on the machine you're typing on.{}\n"
+                               "Run `{} setup` on that machine (your laptop), then reconnect.",
+                               why, program().name);
+    else
+        out.what = std::format("can't reach a clipboard.{}\nRun `{} setup` on the machine you type on, then reconnect.", why,
+                               program().name);
+    return out;
 }
 
-auto paste_impl(const PasteOptions& opt, std::uint32_t hops, const Situation& s) -> Result<Clip> {
-    return walk(plan(s, config()), opt, hops, s.ssh);
+auto advance_impl(Walk& w, const PasteOptions& opt, std::uint32_t hops) -> Result<Clip> {
+    while (w.next < w.routes.size()) {
+        const auto route = w.routes[w.next];
+        auto r = try_route(route, opt, hops, w.situation.images);
+        if (r) {
+            w.next = w.routes.size();
+            return r;
+        }
+        auto e = tagged(std::move(r.error()), route);
+        // The caller asks the terminal itself, then skip()s if it was silent.
+        if (e.code == Code::needs_terminal) return std::unexpected(std::move(e));
+        ++w.next;
+        if (!moves_on(route, e.code)) {
+            w.next = w.routes.size();
+            return std::unexpected(std::move(e));
+        }
+        w.causes.push_back(std::move(e));
+    }
+    return std::unexpected(exhausted(w));
 }
+
+auto walk(const std::vector<Route>& routes, const PasteOptions& opt, std::uint32_t hops, const Situation& s)
+    -> Result<Clip> {
+    Walk w{s, routes, 0, {}};
+    for (;;) {
+        auto r = advance_impl(w, opt, hops);
+        if (r || r.error().code != Code::needs_terminal) return r;
+        // No terminal to ask here (no tty): note it and go on.
+        skip(w, std::move(r.error()));
+    }
+}
+
 
 [[maybe_unused]] auto parse_tcp_info(std::string_view s) -> Result<TcpEndpoint> {
     // "port token\n"
@@ -427,8 +473,41 @@ auto fetch(const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<s
     return exchange(std::move(*fd), e, max, hops);
 }
 
+namespace {
+
+// What tmux knows about the terminal outside it, e.g. "xterm-kitty" plus
+// "kitty(0.49.2)". Empty if tmux won't say.
+auto tmux_outer_terminal() -> std::string {
+    auto pane = env("TMUX_PANE");
+    if (!pane) return {};
+    std::vector<std::string> q{"tmux", "display", "-p", "-t", *pane, "#{client_termname} #{client_termtype}"};
+    return run_capture(q, Millis(1000)).value_or("");
+}
+
+auto images_from(std::string_view term) -> Images {
+    if (term.empty()) return Images::unknown;
+    // kitty is the one terminal that answers OSC 5522 reads.
+    return term.contains("kitty") ? Images::yes : Images::no;
+}
+
+}  // namespace
+
 auto sense(const PasteOptions& opt) -> Situation {
-    return {.ssh = in_ssh_session(), .tmux = opt.tmux_buffer && in_tmux_pane()};
+    Situation s{.ssh = in_ssh_session(), .tmux = opt.tmux_buffer && in_tmux_pane()};
+    switch (config().terminal) {
+        case TerminalMode::osc5522: s.images = Images::yes; return s;
+        case TerminalMode::osc52:
+        case TerminalMode::off: s.images = Images::no; return s;
+        case TerminalMode::automatic: break;
+    }
+    if (s.tmux) {
+        s.images = images_from(tmux_outer_terminal());
+    } else if (env("KITTY_WINDOW_ID")) {
+        s.images = Images::yes;
+    } else if (auto t = env("TERM"); t && t->contains("kitty")) {
+        s.images = Images::yes;
+    }
+    return s;
 }
 
 auto plan(const Situation& s, const Config& c) -> std::vector<Route> {
@@ -438,31 +517,62 @@ auto plan(const Situation& s, const Config& c) -> std::vector<Route> {
     auto add = [&](bool on, Route r) {
         if (on) out.push_back(r);
     };
-    if (s.ssh) {
-        add(c.forwards, Route::forward);
-        add(term && s.tmux, Route::tmux_buffer);
-        add(term, Route::terminal);
-        // This server's own clipboard isn't the one you copied into, so only
-        // when asked for.
-        add(c.display && c.server_display, Route::display);
-    } else {
-        add(c.display, Route::display);
-        add(c.forwards, Route::forward);
-        add(term && s.tmux, Route::tmux_buffer);
-        add(term, Route::terminal);
+    // This machine's clipboard is the one you copied into only when you're
+    // not over ssh; over ssh it's someone else's, so only when asked for.
+    const bool display = c.display && (!s.ssh || c.server_display);
+    add(display && !s.ssh, Route::display);
+    // Set up once with `setup`; costs one connect() when it isn't there.
+    add(c.forwards, Route::forward);
+    if (term) {
+        if (!s.tmux) {
+            add(true, Route::terminal);
+        } else {
+            // Inside tmux, ask the terminal directly only if it can send images
+            // (kitty). A plain OSC 52 reply that crosses tmux into our input
+            // gets cut or re-encoded; the tmux buffer gets text exactly.
+            add(s.images == Images::yes, Route::terminal);
+            add(true, Route::tmux_buffer);
+        }
     }
+    add(display && s.ssh, Route::display);
     return out;
 }
 
-auto paste(const PasteOptions& opt) -> Result<Clip> {
-    auto clip = paste_impl(opt, 0, sense(opt));
-    if (!clip) return clip;
-    if (!config().decode_text) return clip;
+auto start(const PasteOptions& opt) -> Walk {
+    auto s = sense(opt);
+    return Walk{s, plan(s, config()), 0, {}};
+}
+
+auto advance(Walk& w, const PasteOptions& opt) -> Result<Clip> {
+    auto clip = advance_impl(w, opt, 0);
+    if (!clip || !config().decode_text) return clip;
     // Whatever route it came by, an image or file copied as text arrives as itself.
     std::vector<std::string> errors;
     clip->items = armor::expand(std::move(clip->items), &errors);
     if (!errors.empty() && clip->items.empty()) return fail(Code::corrupt, "{}", errors.front());
     return clip;
+}
+
+void skip(Walk& w, Error why) {
+    if (w.next >= w.routes.size()) return;
+    why.route = w.routes[w.next];
+    const bool refused = why.code == Code::refused;
+    w.causes.push_back(std::move(why));
+    ++w.next;
+    // A terminal that refused us refuses tmux's read for us too: skip it.
+    if (refused && w.next < w.routes.size() && w.routes[w.next] == Route::tmux_buffer) {
+        w.causes.push_back(Error{Code::refused, "skipped: the same terminal refused reads", {}, Route::tmux_buffer});
+        ++w.next;
+    }
+}
+
+auto paste(const PasteOptions& opt) -> Result<Clip> {
+    auto w = start(opt);
+    for (;;) {
+        auto r = advance(w, opt);
+        if (r || r.error().code != Code::needs_terminal) return r;
+        skip(w, std::move(r.error()));
+    }
 }
 
 // The agent reads its own display first, and relays to the next hop if it has none.
@@ -473,7 +583,7 @@ auto agent_source() -> Source {
         o.tmux_buffer = false;  // a background agent has no pane to ask
         auto routes = plan(Situation{}, config());
         std::erase(routes, Route::terminal);
-        return walk(routes, o, hops, false);
+        return walk(routes, o, hops, Situation{});
     };
 }
 

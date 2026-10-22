@@ -107,22 +107,55 @@ struct PasteOptions {
     // Inside tmux, ask tmux for the outer terminal's clipboard and read it from
     // a paste buffer (no tty needed, nothing crosses our input).
     bool tmux_buffer = true;
-    int tmux_timeout_ms = 8000;
+    // tmux's reply is a few hundred bytes for text, or one image line; it
+    // starts arriving within a round trip. Big lines extend the wait (see inband).
+    int tmux_timeout_ms = 3000;
 };
 
 // What paste() looks at to pick its routes. sense() reads it from this
 // process (env, tmux); tests build one by hand.
+enum class Images : std::uint8_t { no, unknown, yes };
 struct Situation {
     bool ssh = false;   // we run inside an ssh session
     bool tmux = false;  // inside a live tmux pane, and opt.tmux_buffer is on
+    // Can the terminal you type in send images (OSC 5522, kitty)? Inside tmux,
+    // tmux tells us which terminal is outside; elsewhere TERM hints, and an
+    // unknown terminal is asked (DECRQM) when the route runs.
+    Images images = Images::unknown;
 };
 auto sense(const PasteOptions& opt) -> Situation;
 
 // The routes paste() tries, in order, for a situation and config. Pure.
-// Over ssh the clipboard you copied into is on the machine you type on, so
-// forwards and the terminal come first, and this server's display only if
-// Config::server_display says so. Locally the display comes first.
+// Cheapest and most faithful first, and none of them need setup except the
+// forward, which costs nothing to check when it isn't there:
+//   forward      the agent on your laptop (only if `setup` was run)
+//   display      this machine's clipboard (first when local; over ssh only
+//                with server_display, since it isn't the one you copied into)
+//   terminal     ask the terminal: images and text over OSC 5522 (kitty),
+//                else text over OSC 52
+//   tmux_buffer  inside tmux, tmux asks the terminal for text and we read
+//                its buffer, exact and with no size cap
+// Inside tmux the terminal is asked directly only for images (kitty); text
+// goes through the tmux buffer, since an OSC 52 reply that crosses tmux into
+// our input gets cut or re-encoded.
 auto plan(const Situation& s, const Config& c) -> std::vector<Route>;
+
+// A paste in progress, for apps that ask the terminal themselves (through
+// their own input, like agentty): advance() runs the routes it can on this
+// thread and stops when the next one needs the terminal. The app asks, and
+// if nothing comes back calls skip() and advance() again, on a worker.
+struct Walk {
+    Situation situation;
+    std::vector<Route> routes;
+    std::size_t next = 0;
+    std::vector<Error> causes;  // one per route that had nothing
+};
+auto start(const PasteOptions& opt = {}) -> Walk;
+// The clip, or an error. Code::needs_terminal (with route set) means: ask the
+// terminal now, using w.situation.images to pick OSC 5522 or OSC 52.
+auto advance(Walk& w, const PasteOptions& opt = {}) -> Result<Clip>;
+// The route advance() stopped at got nothing back; record why and move past it.
+void skip(Walk& w, Error why);
 
 // The one call an app needs: finds the right clipboard and returns what's on it.
 // Walks plan(sense(opt), config()). Every failure carries a Code; when no

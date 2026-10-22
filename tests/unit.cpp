@@ -150,16 +150,42 @@ void test_errors() {
 void test_plan() {
     Config c;
     using V = std::vector<Route>;
+    using I = Images;
     check(plan({.ssh = false, .tmux = false}, c) == V{Route::display, Route::forward, Route::terminal}, "plan: local");
     check(plan({.ssh = true, .tmux = false}, c) == V{Route::forward, Route::terminal}, "plan: ssh skips server display");
-    check(plan({.ssh = true, .tmux = true}, c) == V{Route::forward, Route::tmux_buffer, Route::terminal},
-          "plan: ssh + tmux");
+    // Inside tmux: kitty is asked first (it sends images), tmux's buffer is the
+    // text fallback. Any other terminal: text through tmux only.
+    check(plan({.ssh = true, .tmux = true, .images = I::yes}, c) == V{Route::forward, Route::terminal, Route::tmux_buffer},
+          "plan: ssh + tmux + kitty");
+    check(plan({.ssh = true, .tmux = true, .images = I::no}, c) == V{Route::forward, Route::tmux_buffer},
+          "plan: ssh + tmux + other terminal");
+    check(plan({.ssh = true, .tmux = true, .images = I::unknown}, c) == V{Route::forward, Route::tmux_buffer},
+          "plan: ssh + tmux + unknown terminal");
     c.server_display = true;
     check(plan({.ssh = true, .tmux = false}, c).back() == Route::display, "plan: server_display last");
     c.terminal = TerminalMode::off;
     check(plan({.ssh = true, .tmux = true}, c) == V{Route::forward, Route::display}, "plan: terminal off drops tmux too");
     c.socket = "/tmp/x.sock";
     check(plan({.ssh = true, .tmux = true}, c) == V{Route::socket}, "plan: a set socket is the only route");
+}
+
+void test_walk() {
+    // No terminal handed in: the walk stops at the terminal for the caller to
+    // ask, and resumes after skip().
+    Walk w{{.ssh = true, .tmux = false, .images = Images::yes}, {Route::terminal}, 0, {}};
+    auto r = advance(w);
+    check(!r && r.error().code == Code::needs_terminal && r.error().route == Route::terminal,
+          "walk: stops at the terminal for the caller");
+    skip(w, Error{Code::no_answer, "silent", {}, {}});
+    check(w.next == 1 && w.causes.size() == 1 && w.causes[0].route == Route::terminal, "walk: skip records why");
+    auto end = advance(w);
+    check(!end && end.error().code == Code::no_route && end.error().from(Route::terminal), "walk: no_route with causes");
+    // The terminal saying "empty" (no text for an image) is a cause; if that's
+    // all there was, the clipboard is empty.
+    Walk em{{.ssh = true}, {Route::terminal}, 0, {}};
+    skip(em, Error{Code::empty, "clipboard is empty", {}, {}});
+    auto ee = advance(em);
+    check(!ee && ee.error().code == Code::empty, "walk: only empties is empty");
 }
 
 void test_progress() {
@@ -356,6 +382,7 @@ int main() {
     test_wire();
     test_errors();
     test_plan();
+    test_walk();
     test_progress();
     test_stripped();
     test_choose();

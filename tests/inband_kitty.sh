@@ -55,6 +55,19 @@ grep -q "ok via terminal (OSC 5522)" "$T/out1" && grep -q "$WANT" "$T/out1" \
 run_kitty "tmux -L rpib -f /dev/null new '$APPENV $BIN doctor > $T/out2 2>&1'"
 grep -q "ok via terminal (OSC 5522)" "$T/out2" && grep -q "$WANT" "$T/out2" \
     && ok "kitty + tmux: image via passthrough, sha matches" || { bad "kitty+tmux 5522"; cat "$T/out2"; }
+
+# --- over ssh in tmux, image on the clipboard, no agent: kitty is asked first
+# (it sends images), not after tmux's text-only read has timed out ---
+cat > "$T/order.sh" <<EOF
+S=\$(date +%s%N)
+$APPENV SSH_CONNECTION=x RICHPASTE_NO_FORWARDS=1 $BIN doctor > $T/out2b 2>&1
+echo ms=\$(( (\$(date +%s%N)-S)/1000000 )) >> $T/out2b
+EOF
+run_kitty "tmux -L rpib -f /dev/null new 'sh $T/order.sh'"
+MS=$(sed -n 's/^ms=//p' "$T/out2b")
+grep -q "plan .*terminal -> tmux_buffer" "$T/out2b" && grep -q "ok via terminal (OSC 5522)" "$T/out2b" && grep -q "$WANT" "$T/out2b" \
+    && [ "${MS:-99999}" -lt 2500 ] \
+    && ok "kitty + tmux over ssh: image first try (${MS} ms)" || { bad "kitty+tmux ssh image order"; cat "$T/out2b"; }
 kill "$OW"; wait "$OW" 2>/dev/null; OW=
 # tmux setting must be per-pane only; the global one must be untouched.
 tmux -L rpib kill-server 2>/dev/null
@@ -90,8 +103,9 @@ printf 'Port %s\nListenAddress 127.0.0.1\nHostKey %s/hk\nPidFile %s/sshd.pid\nAu
 sleep 0.3
 "$OWNER" "$DNUM" image/png "$T/shot.png" >/dev/null & OW=$!
 sleep 0.3
-SSHC="ssh -tt -p $PORT -i $T/uk -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR 127.0.0.1"
-run_kitty "$SSHC \"tmux -L rpib -f /dev/null new '$APPENV $BIN doctor > $T/out7 2>&1'\""
+SSHC="ssh -F /dev/null -tt -p $PORT -i $T/uk -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR 127.0.0.1"
+# No forwards: this case is about the terminal route alone.
+run_kitty "$SSHC \"tmux -L rpib -f /dev/null new '$APPENV RICHPASTE_NO_FORWARDS=1 $BIN doctor > $T/out7 2>&1'\""
 grep -q "ok via terminal (OSC 5522)" "$T/out7" && grep -q "$WANT" "$T/out7" \
     && ok "kitty -> ssh -> tmux, no agent: image via OSC 5522" || { bad "ssh no-agent"; cat "$T/out7"; }
 kill "$(cat "$T/sshd.pid")" 2>/dev/null
