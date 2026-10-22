@@ -95,6 +95,13 @@ struct Attempt {
     std::vector<std::string> errors;
 };
 
+// A live tmux pane we can ask things of. $TMUX alone can be stale.
+auto in_tmux_pane() -> bool {
+    if (!env("TMUX") || !env("TMUX_PANE")) return false;
+    std::vector<std::string> q{"tmux", "display", "-p", "-t", *env("TMUX_PANE"), "#{pane_id}"};
+    return run_capture(q, Millis(1000)).has_value();
+}
+
 auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::optional<Result<Clip>> {
     if (!config().forwards) return std::nullopt;
     for (auto& s : find_forwarded_sockets()) {
@@ -125,8 +132,22 @@ auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> 
 }
 
 auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<Clip>> {
-    if (!opt.terminal) return std::nullopt;
     if (config().terminal == TerminalMode::off) return std::nullopt;
+    // Inside tmux, let tmux fetch the outer terminal's clipboard into a paste
+    // buffer and read that buffer directly. The reply never passes through
+    // our input (where keyboard modes like extended-keys, slow links and
+    // stray terminal reports can mangle a big reply), and it works with no
+    // tty of our own. Text only, but a richpaste:1: line in it becomes the
+    // image or file in paste().
+    if (opt.tmux_buffer && in_tmux_pane()) {
+        auto t = inband::tmux_refresh_clipboard(Millis(opt.tmux_timeout_ms));
+        if (t && !t->empty()) {
+            if (t->size() > opt.max_bytes) return fail("clipboard is larger than the {} limit", human_size(opt.max_bytes));
+            return Clip{{Text::repair(*t)}, "terminal via tmux buffer"};
+        }
+        a.errors.push_back(std::format("tmux: {}", t ? std::string{"clipboard is empty"} : t.error().what));
+    }
+    if (!opt.terminal) return std::nullopt;
     inband::Session s = *opt.terminal;
     auto caps = inband::detect(s, Millis(1500));
     auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));

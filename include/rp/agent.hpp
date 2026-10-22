@@ -107,6 +107,10 @@ struct PasteOptions {
     // How to ask the terminal (OSC 5522 / 52). Unset = never ask it.
     // Nothing else may read the terminal during the call.
     std::optional<inband::Session> terminal;
+    // Inside tmux, ask tmux for the outer terminal's clipboard and read it from
+    // a paste buffer (no tty needed, nothing crosses our input).
+    bool tmux_buffer = true;
+    int tmux_timeout_ms = 8000;
 };
 
 // The one call an app needs: finds the right clipboard and returns what's on it.

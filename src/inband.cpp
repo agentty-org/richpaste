@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <thread>
+
+namespace fs = std::filesystem;
 
 namespace rp::inband {
 
@@ -340,15 +343,34 @@ auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
         return {t, sp == std::string::npos ? "" : line.substr(sp + 1)};
     };
     auto before = newest();
+    // Ask the client attached to OUR pane (several may be attached).
     std::vector<std::string> refresh{"tmux", "refresh-client", "-l"};
+    if (auto pane = env("TMUX_PANE")) {
+        std::vector<std::string> q{"tmux", "display", "-p", "-t", *pane, "#{client_name}"};
+        if (auto c = run_capture(q, Millis(1000)); c && !c->empty()) {
+            refresh.push_back("-t");
+            refresh.push_back(*c);
+        }
+    }
     if (!run_capture(refresh, Millis(1000))) return fail("tmux refresh-client -l failed");
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         auto now = newest();
         if (!now.second.empty() && now != before) {
-            std::vector<std::string> show{"tmux", "show-buffer", "-b", now.second};
-            auto out = run_capture(show, Millis(2000));
-            if (out) return *out;
+            // Save to a private file rather than read stdout: no size cap and
+            // the bytes exactly as copied. Then drop the buffer so pastes don't
+            // pile up in the user's tmux buffer list.
+            auto file = fs::temp_directory_path() / ("richpaste-tmux-" + random_hex(8));
+            std::vector<std::string> save{"tmux", "save-buffer", "-b", now.second, file.string()};
+            auto saved = run_capture(save, Millis(10000));
+            std::vector<std::string> del{"tmux", "delete-buffer", "-b", now.second};
+            (void)run_capture(del, Millis(1000));
+            if (!saved) return fail("tmux save-buffer failed");
+            auto bytes = read_file(file, 1ull << 30);
+            std::error_code ec;
+            fs::remove(file, ec);
+            if (!bytes) return std::unexpected(bytes.error());
+            return as_string(*bytes);
         }
         std::this_thread::sleep_for(Millis(50));
     }
