@@ -9,11 +9,33 @@ namespace rp::armor {
 
 namespace {
 
+// Standard base64, plus the URL-safe '-' '_' some encoders use. Decoding
+// maps those back.
 auto is_b64(char c) -> bool {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' ||
-           c == '=';
+           c == '=' || c == '-' || c == '_';
 }
-auto is_space(char c) -> bool { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
+// What terminals and mail clients put inside a long line: wrapping, CR/LF,
+// tabs. (Unicode spaces some apps insert: skip_unicode_space.)
+auto is_space(char c) -> bool { return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\f' || c == '\v'; }
+
+// A no-break, zero-width or BOM character (U+00A0, U+200B..U+200D, U+2060,
+// U+FEFF) that an editor or chat app slipped into the line. Skips it and
+// returns true.
+auto skip_unicode_space(std::string_view s, std::size_t& p) -> bool {
+    auto at = [&](std::string_view seq) { return s.substr(p, seq.size()) == seq; };
+    for (std::string_view seq : {"\xc2\xa0", "\xe2\x80\x8b", "\xe2\x80\x8c", "\xe2\x80\x8d", "\xe2\x81\xa0", "\xef\xbb\xbf"})
+        if (at(seq)) {
+            p += seq.size();
+            return true;
+        }
+    return false;
+}
+
+auto printable(char c) -> std::string {
+    auto u = static_cast<unsigned char>(c);
+    return u >= 0x20 && u < 0x7f ? std::string(1, c) : std::format("\\x{:02x}", u);
+}
 
 // Reads one ':'-terminated header field, dropping any whitespace a terminal wrapped into it.
 auto field(std::string_view s, std::size_t& i) -> std::optional<std::string> {
@@ -34,6 +56,55 @@ struct Block {
     std::size_t end;  // index just past the block
 };
 
+// Reads a block's base64 from s[p], skipping whatever a terminal, editor or
+// chat app put inside the line. Shared by the decoder and progress(), so
+// "complete" means the same thing to both.
+struct Data {
+    std::string b64;     // normalised (URL-safe mapped back), padded when whole
+    std::size_t end = 0; // index just past what was read
+    bool whole = false;  // all of it is here
+    bool stopped = false;  // something that isn't data came first
+};
+auto read_data(std::string_view s, std::size_t p, std::uint64_t size) -> Data {
+    const std::size_t need = (size + 2) / 3 * 4;
+    // Without padding the data is shorter; that's still all of it.
+    const std::size_t need_unpadded = (size * 4 + 2) / 3;
+    Data d;
+    d.b64.reserve(need);
+    while (p < s.size() && d.b64.size() < need) {
+        const char c = s[p];
+        if (is_b64(c)) {
+            // Padding only ever closes the data.
+            if (c == '=' && d.b64.size() < need_unpadded) break;
+            d.b64 += c == '-' ? '+' : c == '_' ? '/' : c;
+        } else if (static_cast<unsigned char>(c) >= 0x80 && skip_unicode_space(s, p)) {
+            continue;
+        } else if (!is_space(c)) {
+            break;
+        } else if (d.b64.size() >= need_unpadded) {
+            // All the data is here, unpadded, and a space follows: the next
+            // word is text, not the padding.
+            break;
+        }
+        ++p;
+    }
+    d.end = p;
+    if (d.b64.size() < need && d.b64.size() >= need_unpadded && (p < s.size())) {
+        // Unpadded and followed by more text: complete. If the padding was
+        // only wrapped onto the next line, take it so it isn't left as text.
+        std::size_t q = p;
+        while (q < s.size() && is_space(s[q])) ++q;
+        std::size_t pad = 0;
+        while (q + pad < s.size() && s[q + pad] == '=' && d.b64.size() + pad < need) ++pad;
+        if (pad > 0 && d.b64.size() + pad == need) d.end = q + pad;
+        d.b64.resize(need_unpadded);
+        d.b64.append(need - need_unpadded, '=');
+    }
+    d.whole = d.b64.size() >= need;
+    d.stopped = !d.whole && p < s.size();
+    return d;
+}
+
 // Parses one block that starts at s[i] (at the magic).
 auto parse_block(std::string_view s, std::size_t i) -> Block {
     auto skip_token = [&](std::size_t from) {
@@ -52,22 +123,33 @@ auto parse_block(std::string_view s, std::size_t i) -> Block {
     if (ec != std::errc{} || ptr != size_s->data() + size_s->size() || size > (1ull << 30))
         return {std::nullopt, "pasted block has a bad size", skip_token(i)};
 
-    // Collect exactly the base64 this size needs, skipping whitespace terminals may add.
-    std::size_t need = (size + 2) / 3 * 4;
-    std::string b64;
-    b64.reserve(need);
-    while (p < s.size() && b64.size() < need) {
-        char c = s[p];
-        if (is_b64(c)) b64 += c;
-        else if (!is_space(c)) break;
-        ++p;
+    auto d = read_data(s, p, size);
+    p = d.end;
+    // At the very end of the text, unpadded data is whole too (nothing more
+    // is coming once the caller decodes).
+    const std::size_t need = (size + 2) / 3 * 4, need_unpadded = (size * 4 + 2) / 3;
+    if (!d.whole && d.b64.size() >= need_unpadded) {
+        d.b64.resize(need_unpadded);
+        d.b64.append(need - need_unpadded, '=');
+        d.whole = true;
     }
-    if (b64.size() < need)
-        return {std::nullopt, std::format("pasted block is cut short ({} of {} bytes)", b64.size() / 4 * 3, size), p};
+    if (!d.whole) {
+        const auto got = std::min<std::uint64_t>(d.b64.size() * 3 / 4, size);
+        // Something other than data came before the end: say so, not "cut short".
+        if (d.stopped)
+            return {std::nullopt,
+                    std::format("pasted block has a stray '{}' after {} of {} bytes", printable(s[p]), got, size), p};
+        return {std::nullopt, std::format("pasted block is cut short ({} of {} bytes)", got, size), p};
+    }
+    auto& b64 = d.b64;
 
     auto data = base64_decode(b64);
     if (!data || data->size() != size) return {std::nullopt, "pasted block is corrupted (bad base64)", p};
-    if (!sha_s->empty() && hex(sha256(*data)) != *sha_s) return {std::nullopt, "pasted block is corrupted (sha256 mismatch)", p};
+    if (!sha_s->empty()) {
+        std::string want = *sha_s;
+        std::ranges::transform(want, want.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+        if (hex(sha256(*data)) != want) return {std::nullopt, "pasted block is corrupted (sha256 mismatch)", p};
+    }
 
     std::string name;
     if (!name_s->empty()) {
@@ -119,17 +201,18 @@ auto progress(std::string_view s) -> Progress {
         std::uint64_t size = 0;
         auto [ptr, ec] = std::from_chars(f[2]->data(), f[2]->data() + f[2]->size(), size);
         if (ec != std::errc{} || ptr != f[2]->data() + f[2]->size() || size > (1ull << 30)) continue;
-        const std::size_t need = (size + 2) / 3 * 4;
-        std::size_t got = 0;
-        while (p < s.size() && got < need) {
-            if (is_b64(s[p])) ++got;
-            else if (!is_space(s[p])) break;
-            ++p;
+        auto d = read_data(s, p, size);
+        // Short, and the text just ends: more is coming (an unpadded block
+        // that's exactly long enough is whole only once something follows, so
+        // a paste in pieces is never decoded early). Short and something else
+        // follows: it was cut, split() will say so.
+        if (!d.whole && !d.stopped) return {Progress::State::partial, std::min<std::uint64_t>(d.b64.size() * 3 / 4, size), size};
+        // Cut: final, but say how far the first one got.
+        if (!d.whole && out.need == 0) {
+            out.have = std::min<std::uint64_t>(d.b64.size() * 3 / 4, size);
+            out.need = size;
         }
-        // Short, and the text just ends: more is coming. Short and something
-        // else follows: it was cut, split() will say so.
-        if (got < need && p >= s.size()) return {Progress::State::partial, std::min<std::uint64_t>(got / 4 * 3, size), size};
-        at = p - magic.size();
+        at = d.end - magic.size();
     }
     return out;
 }
@@ -176,8 +259,9 @@ auto expand(std::vector<Item> items, std::vector<std::string>* errors) -> std::v
 }
 
 auto mac_snippet() -> std::string {
-    // Only stock macOS tools. Copied file -> that file; otherwise the image (as PNG).
-    return R"SH(d=$(mktemp -d); f=$d/c; if p=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null) && [ -f "$p" ]; then cp "$p" "$f"; n=$(printf %s "$(basename "$p")" | base64 | tr -d '\n'); m=application/octet-stream; else osascript -e "set f to open for access POSIX file \"$f\" with write permission" -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' >/dev/null 2>&1; n=; m=image/png; fi; if [ -s "$f" ]; then printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$(wc -c < "$f" | tr -d ' ')" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy; echo 'ready: press Cmd+V in the ssh window'; else echo 'no image or file on the clipboard'; fi; rm -rf "$d")SH";
+    // Only stock macOS tools. Copied file -> that file; otherwise the image,
+    // as PNG, scaled down (sips) until its line fits what tmux passes.
+    return R"SH(d=$(mktemp -d); f=$d/c; if p=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/null) && [ -f "$p" ]; then cp "$p" "$f"; n=$(printf %s "$(basename "$p")" | base64 | tr -d '\n'); m=application/octet-stream; else osascript -e "set f to open for access POSIX file \"$f\" with write permission" -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' >/dev/null 2>&1; n=; m=image/png; for s in 1600 1200 900 700; do [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -le 800000 ] && break; [ -s "$f" ] && sips -Z $s -s format jpeg -s formatOptions 80 "$f" --out "$f.j" >/dev/null 2>&1 && mv "$f.j" "$f" && m=image/jpeg; done; fi; if [ -s "$f" ]; then z=$(wc -c < "$f" | tr -d ' '); if [ "$z" -gt 1200000 ]; then echo "too big to paste as text ($z bytes): run 'agentty paste setup' on this Mac instead"; else printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$z" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy; echo 'ready: press Cmd+V in the ssh window'; fi; else echo 'no image or file on the clipboard'; fi; rm -rf "$d")SH";
 }
 
 auto mac_hotkey_script() -> std::string {
@@ -189,22 +273,35 @@ if p=$(osascript -e 'POSIX path of (the clipboard as «class furl»)' 2>/dev/nul
 else
   osascript -e "set f to open for access POSIX file \"$f\" with write permission" -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' >/dev/null 2>&1
   n=; m=image/png; r=png
+  cp "$f" "$d/orig" 2>/dev/null
+  # Scale a big screenshot down so its line fits what tmux passes (~2 MB).
+  for s in 1600 1200 900 700; do
+    [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -le 800000 ] && break
+    [ -s "$f" ] && sips -Z $s -s format jpeg -s formatOptions 80 "$f" --out "$f.j" >/dev/null 2>&1 && mv "$f.j" "$f" && m=image/jpeg
+  done
 fi
 if [ ! -s "$f" ]; then
   # Plain text: just paste it as usual.
   sleep 0.3; osascript -e 'tell application "System Events" to keystroke "v" using command down'; rm -rf "$d"; exit 0
 fi
-printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$(wc -c < "$f" | tr -d ' ')" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy
+z=$(wc -c < "$f" | tr -d ' ')
+if [ "$z" -gt 1200000 ]; then
+  osascript -e "display notification \"Too big to paste as text ($z bytes). Run agentty paste setup on this Mac.\" with title \"agentty paste\""
+  rm -rf "$d"; exit 1
+fi
+printf 'richpaste:1:%s:%s:%s:%s:%s' "$m" "$n" "$z" "$(shasum -a 256 "$f" | cut -c1-64)" "$(base64 < "$f" | tr -d '\n')" | pbcopy
 sleep 0.3
 osascript -e 'tell application "System Events" to keystroke "v" using command down'
 sleep 1
-if [ "$r" = png ]; then osascript -e "set the clipboard to (read POSIX file \"$f\" as «class PNGf»)"; else osascript -e "set the clipboard to (POSIX file \"$p\")"; fi
+if [ "$r" = png ]; then osascript -e "set the clipboard to (read POSIX file \"$d/orig\" as «class PNGf»)"; else osascript -e "set the clipboard to (POSIX file \"$p\")"; fi
 rm -rf "$d")SH";
 }
 
 auto windows_snippet() -> std::string {
-    // Stock Windows PowerShell 5.1. Copied file -> that file; otherwise the image (as PNG).
-    return R"PS(Add-Type -A System.Windows.Forms,System.Drawing; $c=[Windows.Forms.Clipboard]; if($c::ContainsFileDropList()){$p=$c::GetFileDropList()[0]; $b=[IO.File]::ReadAllBytes($p); $n=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFileName($p))); $m='application/octet-stream'} elseif($c::ContainsImage()){$s=New-Object IO.MemoryStream; $c::GetImage().Save($s,[Drawing.Imaging.ImageFormat]::Png); $b=$s.ToArray(); $n=''; $m='image/png'} else {'no image or file on the clipboard'; return}; $h=-join([Security.Cryptography.SHA256]::Create().ComputeHash($b)|%{$_.ToString('x2')}); Set-Clipboard -Value "richpaste:1:${m}:${n}:$($b.Length):${h}:$([Convert]::ToBase64String($b))"; 'ready: paste in the ssh window')PS";
+    // Stock Windows PowerShell 5.1. Copied file -> that file; otherwise the
+    // image as PNG, or scaled-down JPEG when that's too big for one line
+    // that tmux passes.
+    return R"PS(Add-Type -A System.Windows.Forms,System.Drawing; $c=[Windows.Forms.Clipboard]; if($c::ContainsFileDropList()){$p=$c::GetFileDropList()[0]; $b=[IO.File]::ReadAllBytes($p); $n=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFileName($p))); $m='application/octet-stream'} elseif($c::ContainsImage()){$i=$c::GetImage(); $s=New-Object IO.MemoryStream; $i.Save($s,[Drawing.Imaging.ImageFormat]::Png); $b=$s.ToArray(); $m='image/png'; foreach($z in 1600,1200,900,700){if($b.Length -le 800000){break}; $k=[Math]::Min(1,$z/[Math]::Max($i.Width,$i.Height)); $t=New-Object Drawing.Bitmap $i,([int]($i.Width*$k)),([int]($i.Height*$k)); $s=New-Object IO.MemoryStream; $t.Save($s,[Drawing.Imaging.ImageFormat]::Jpeg); $b=$s.ToArray(); $m='image/jpeg'}; $n=''} else {'no image or file on the clipboard'; return}; if($b.Length -gt 1200000){"too big to paste as text ($($b.Length) bytes): run 'agentty paste setup' on this PC instead"; return}; $h=-join([Security.Cryptography.SHA256]::Create().ComputeHash($b)|%{$_.ToString('x2')}); Set-Clipboard -Value "richpaste:1:${m}:${n}:$($b.Length):${h}:$([Convert]::ToBase64String($b))"; 'ready: paste in the ssh window')PS";
 }
 
 namespace {

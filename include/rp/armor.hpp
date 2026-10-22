@@ -35,8 +35,10 @@ struct Progress {
         complete,  // every block has all its data (or is broken): split() now gives the final answer
     };
     State state = State::none;
-    std::uint64_t have = 0;  // data bytes of the first unfinished block received so far
-    std::uint64_t need = 0;  // its full size; 0 while its header is still arriving
+    // The first unfinished block (arriving, or cut short): bytes of it here so
+    // far, and its full size. need is 0 when there's none, or its header is cut.
+    std::uint64_t have = 0;
+    std::uint64_t need = 0;
 };
 auto progress(std::string_view text) -> Progress;
 

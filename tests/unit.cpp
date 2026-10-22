@@ -212,6 +212,133 @@ void test_progress() {
     check(armor::progress(line + " " + line.substr(0, 100)).state == S::partial, "progress: second block arriving");
 }
 
+// Everything that happens to a long line in the wild. Each must still decode
+// to exactly the bytes, or be refused; never wrong bytes.
+void test_armor_mangled() {
+    Bytes img(5000);
+    for (std::size_t i = 0; i < img.size(); ++i) img[i] = std::byte((i * 131 + 7) & 0xff);
+    const auto line = armor::encode(Image{*Mime::parse("image/png"), img});
+    auto decodes = [&](const std::string& t) {
+        auto sp = armor::split(t);
+        for (auto& p : sp.parts)
+            if (auto* it = std::get_if<Item>(&p))
+                if (auto* im = std::get_if<Image>(it)) return im->data == img;
+        return false;
+    };
+    auto refused = [&](const std::string& t) {
+        auto sp = armor::split(t);
+        for (auto& p : sp.parts)
+            if (std::holds_alternative<Item>(p)) return false;
+        return !sp.errors.empty();
+    };
+    auto wrap = [](const std::string& s, std::size_t n, std::string_view nl) {
+        std::string o;
+        for (std::size_t i = 0; i < s.size(); i += n) o += s.substr(i, n) + std::string(nl);
+        return o;
+    };
+    const auto data_at = line.rfind(':') + 1;
+
+    check(decodes(wrap(line, 80, "\n")), "mangled: wrapped at 80, LF");
+    check(decodes(wrap(line, 64, "\r\n")), "mangled: wrapped at 64, CRLF");
+    check(decodes(wrap(line, 76, "\n  ")), "mangled: wrapped with indent (mail, chat quote)");
+    check(decodes("  \t" + line + "\n\n"), "mangled: surrounding whitespace");
+    check(decodes("look at this: " + line + " thanks"), "mangled: text around it");
+    check(decodes("\xef\xbb\xbf" + line), "mangled: BOM before it");
+    {
+        std::string z = line;
+        for (std::size_t i = data_at + 100; i < z.size(); i += 500) z.insert(i, "\xe2\x80\x8b");
+        check(decodes(z), "mangled: zero-width spaces inside the data");
+    }
+    {
+        std::string nb = line;
+        nb.insert(data_at + 50, "\xc2\xa0");
+        check(decodes(nb), "mangled: no-break space inside the data");
+    }
+    {
+        std::string url = line;
+        for (std::size_t i = data_at; i < url.size(); ++i) url[i] = url[i] == '+' ? '-' : url[i] == '/' ? '_' : url[i];
+        check(decodes(url), "mangled: URL-safe base64");
+    }
+    {
+        std::string nopad = line;
+        while (nopad.back() == '=') nopad.pop_back();
+        check(decodes(nopad), "mangled: padding stripped (end of text)");
+        check(decodes(nopad + " and more"), "mangled: padding stripped (text after)");
+    }
+    {
+        std::string up = line;
+        auto sha_end = data_at - 1, sha_start = up.rfind(':', sha_end - 1) + 1;
+        for (auto i = sha_start; i < sha_end; ++i) up[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(up[i])));
+        check(decodes(up), "mangled: uppercase sha256");
+    }
+    check(decodes(line + "\n" + line), "mangled: pasted twice (both decode)");
+    {
+        // Wrapped so the padding lands alone on the next line: nothing left over.
+        std::string w = line.substr(0, line.size() - 1) + "\n" + line.substr(line.size() - 1) + " ok";
+        auto sp = armor::split(w);
+        std::string rest;
+        for (auto& p : sp.parts)
+            if (auto* t = std::get_if<std::string>(&p)) rest += *t;
+        check(decodes(w) && rest.find('=') == std::string::npos, "mangled: padding wrapped onto its own line");
+    }
+
+    // Refused, never wrong bytes.
+    check(refused(line.substr(0, line.size() - 100)), "refused: cut short");
+    {
+        std::string flip = line;
+        flip[data_at + 200] = flip[data_at + 200] == 'A' ? 'B' : 'A';
+        check(refused(flip), "refused: one character changed (sha256)");
+    }
+    {
+        std::string ins = line;
+        ins.insert(data_at + 300, "!");
+        auto sp = armor::split(ins);
+        check(refused(ins) && !sp.errors.empty() && sp.errors[0].contains("stray"), "refused: stray character, named");
+    }
+    {
+        std::string drop = line;
+        drop.erase(data_at + 300, 4);
+        check(refused(drop), "refused: four characters lost");
+    }
+
+    // progress() agrees with the decoder at every cut point.
+    bool agree = true;
+    for (std::size_t cut = 0; cut <= line.size(); cut += 97) {
+        const auto t = line.substr(0, cut);
+        const auto st = armor::progress(t).state;
+        const bool ok = decodes(t);
+        if (cut < 12) continue;   // magic not all here yet: "none"
+        if (ok && st == armor::Progress::State::partial) agree = false;   // would wait forever on a decodable block
+        if (!ok && st == armor::Progress::State::complete && cut < line.size()) agree = false;   // would decode too early
+    }
+    check(agree, "progress: agrees with the decoder at every cut");
+
+    // Fuzz: random damage never crashes, and never yields different bytes.
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    bool safe = true;
+    for (int round = 0; round < 3000; ++round) {
+        std::string t = line;
+        const int edits = 1 + static_cast<int>(rnd() % 4);
+        for (int e = 0; e < edits; ++e) {
+            const auto at = rnd() % t.size();
+            switch (rnd() % 4) {
+                case 0: t[at] = static_cast<char>(rnd() & 0xff); break;
+                case 1: t.erase(at, 1 + rnd() % 8); break;
+                case 2: t.insert(at, std::string(1 + rnd() % 3, static_cast<char>(rnd() & 0xff))); break;
+                case 3: t = t.substr(0, at); break;
+            }
+            if (t.empty()) t = "x";
+        }
+        (void)armor::progress(t);
+        auto sp = armor::split(t);
+        for (auto& p : sp.parts)
+            if (auto* it = std::get_if<Item>(&p))
+                if (auto* im = std::get_if<Image>(it); im && im->data != img) safe = false;
+    }
+    check(safe, "fuzz: 3000 damaged lines, never wrong bytes, never a crash");
+}
+
 void test_stripped() {
     using S = inband::Stripped;
     Bytes img(6000);
@@ -384,6 +511,7 @@ int main() {
     test_plan();
     test_walk();
     test_progress();
+    test_armor_mangled();
     test_stripped();
     test_choose();
     test_store();
