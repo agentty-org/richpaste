@@ -63,7 +63,7 @@ elif b[:2] == b'\xff\xd8': print('jpeg')
 EOF
 )
 IN=$(wc -c < "$T/shot.png"); OUTSZ=$(wc -c < "$T/clip.txt")
-if [ -n "$P" ] && [ -n "$DIMS" ] && [ "$OUTSZ" -lt "$IN" ]; then
+if [ -n "$P" ] && [ -n "$DIMS" ] && [ "$OUTSZ" -lt "$IN" ] && [ "$OUTSZ" -le 1600000 ]; then
     echo "ok   firefox: $IN-byte screenshot -> page -> $OUTSZ-char line -> valid image ($DIMS)"
 else
     echo "FAIL firefox page"; echo "clipboard starts: [$OUT]"; cat "$T/err"

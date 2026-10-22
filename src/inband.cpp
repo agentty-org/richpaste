@@ -343,6 +343,23 @@ auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
         return {t, sp == std::string::npos ? "" : line.substr(sp + 1)};
     };
     auto before = newest();
+    // tmux drops any escape sequence longer than input-buffer-size (1 MB
+    // by default), and a clipboard reply is one sequence: a screenshot sent
+    // as text (base64, x4/3 again in OSC 52) blows straight past it and tmux
+    // just discards it. Raise it on this server before asking. It is a
+    // ceiling, not an allocation, so a big value costs nothing until used.
+    {
+        std::vector<std::string> get{"tmux", "show", "-sv", "input-buffer-size"};
+        long long cur = 0;
+        if (auto v = run_capture(get, Millis(1000))) {
+            try { cur = std::stoll(*v); } catch (...) {}
+        }
+        constexpr long long want = 256ll << 20;
+        if (cur < want) {
+            std::vector<std::string> set{"tmux", "set", "-s", "input-buffer-size", std::to_string(want)};
+            (void)run_capture(set, Millis(1000));
+        }
+    }
     // Ask the client attached to OUR pane (several may be attached).
     std::vector<std::string> refresh{"tmux", "refresh-client", "-l"};
     if (auto pane = env("TMUX_PANE")) {
