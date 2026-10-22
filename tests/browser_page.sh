@@ -25,7 +25,7 @@ user_pref("browser.aboutwelcome.enabled", false);
 EOF
 firefox --no-remote --profile "$T/prof" --new-window "file://$T/rp.html" >"$T/ff.log" 2>&1 & FF=$!
 W=
-for _ in $(seq 1 90); do W=$(xdotool search --name 'richpaste.*Firefox' 2>/dev/null | head -1); [ -n "$W" ] && break; sleep 0.5; done
+for _ in $(seq 1 90); do W=$(xdotool search --name 'agentty paste.*Firefox' 2>/dev/null | head -1); [ -n "$W" ] && break; sleep 0.5; done
 [ -z "$W" ] && { echo "FAIL firefox window never appeared"; tail -5 "$T/ff.log"; exit 1; }
 sleep 2
 xdotool windowfocus "$W" 2>/dev/null; sleep 0.3

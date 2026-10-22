@@ -176,15 +176,20 @@ auto windows_snippet() -> std::string {
 
 auto html_page() -> std::string {
     return R"HTML(<!doctype html>
-<meta charset="utf-8"><title>richpaste</title>
-<style>body{font:16px system-ui;margin:3em;max-width:40em}#s{margin-top:1em}textarea{width:100%;height:6em}
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>agentty paste: an image or file as text</title>
+<meta name="description" content="Turn a screenshot or file into one line of text you can paste into agentty over ssh. Runs in your browser; nothing is uploaded.">
+<style>:root{color-scheme:light dark}body{font:16px system-ui;margin:3em auto;max-width:40em;padding:0 1em;line-height:1.5}#s{margin-top:1em}textarea{width:100%;height:6em}
 #z{border:2px dashed #888;border-radius:8px;padding:2em;text-align:center;outline:none;caret-color:transparent}
-#z:focus{border-color:#06c}</style>
+#z:focus{border-color:#06c}code{font-family:ui-monospace,monospace}small{opacity:.75}</style>
 <h2>Paste or drop an image or file here</h2>
 <p>Click the box, press Cmd+V (or Ctrl+V), or drop a file on it. It becomes one line of text on
-your clipboard. Then paste that into the terminal app. Nothing leaves this page.</p>
+your clipboard. Then paste that into agentty, even over ssh. Nothing leaves this page.</p>
 <div id="z" contenteditable="true" autofocus>paste here</div>
 <div id="s">waiting...</div><button id="b" hidden>Copy text</button><textarea id="t" hidden readonly></textarea>
+<p><small>Only needed when your laptop can't hand agentty its clipboard (Terminal.app over ssh, no
+<code>agentty paste setup</code>). Same page offline: <code>agentty paste page &gt; paste.html</code>.
+More: <a href="https://agentty.org/docs/clipboard">Clipboard &amp; Images</a>.</small></p>
 <script>
 function b64(bytes){let s='';for(let i=0;i<bytes.length;i+=32768)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+32768));return btoa(s)}
 function utf8b64(str){return b64(new TextEncoder().encode(str))}

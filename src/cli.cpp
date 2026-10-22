@@ -34,17 +34,21 @@ auto usage() -> int {
                  "anywhere (local or over ssh):\n"
                  "  {0}{1} [-o DIR]  print text, or save images/files and print paths\n"
                  "  {0} doctor       show what paste would use and why\n"
+                 "{2}"
                  "\n"
                  "when nothing reaches your clipboard (e.g. Terminal.app over ssh):\n"
                  "  {0} howto        one-time Mac/Windows setup to paste images as text\n"
                  "  {0} page         a web page that turns a pasted image into text\n"
                  "  {0} encode FILE  FILE as one line of text; paste it anywhere\n"
                  "  {0} decode [DIR] turn such text on stdin back into files\n",
-                 n, paste_line);
+                 n, paste_line, program().extra_usage);
     return 2;
 }
 
-auto paste_dir() -> fs::path { return state_dir() / "pasted"; }
+auto paste_dir() -> fs::path {
+    if (auto d = config().save_dir; !d.empty()) return d;
+    return state_dir() / "pasted";
+}
 
 void print_items(const Clip& clip, const fs::path& dir) {
     auto pasted = store(clip.items, dir);
@@ -65,7 +69,7 @@ void print_items(const Clip& clip, const fs::path& dir) {
 auto paste_with_terminal(std::uint64_t max) -> Result<Clip> {
     PasteOptions o;
     o.max_bytes = max;
-    auto tty = term::Tty::open();
+    auto tty = config().terminal == TerminalMode::off ? Result<term::Tty>(fail("off")) : term::Tty::open();
     if (tty) o.terminal = tty->session();
     return paste(o);
 }
@@ -77,7 +81,7 @@ auto cmd_paste(Args args) -> int {
         if ((a == "-o" || a == "--out") && i + 1 < args.size()) dir = args[++i];
         else return usage();
     }
-    auto clip = paste_with_terminal(default_max_bytes);
+    auto clip = paste_with_terminal(config().max_bytes);
     if (!clip) {
         std::println(stderr, "{}: {}", program().name, clip.error().what);
         return 1;
@@ -86,7 +90,24 @@ auto cmd_paste(Args args) -> int {
     return 0;
 }
 
+auto terminal_name(TerminalMode m) -> std::string_view {
+    switch (m) {
+        case TerminalMode::automatic: return "auto";
+        case TerminalMode::osc5522: return "osc5522";
+        case TerminalMode::osc52: return "osc52";
+        case TerminalMode::off: return "off";
+    }
+    return "?";
+}
+
 auto cmd_doctor() -> int {
+    const auto c = config();
+    std::println("settings       forwards={} display={} server_display={} terminal={} max={}",
+                 c.forwards ? "on" : "off", c.display ? "on" : "off", c.server_display ? "on" : "off",
+                 terminal_name(c.terminal), human_size(c.max_bytes));
+    if (!c.socket.empty()) std::println("socket         {} (only this one is asked)", c.socket.string());
+    std::println("state dir      {}", state_dir().string());
+    std::println("saves to       {}", paste_dir().string());
     auto ep = local_endpoint();
     std::println("agent          {}  {}", ep ? describe(*ep) : "-", agent_alive() ? "(answering)" : "(not running)");
     std::println("display env    WAYLAND_DISPLAY={} DISPLAY={}", env("WAYLAND_DISPLAY").value_or("-"),
@@ -96,7 +117,7 @@ auto cmd_doctor() -> int {
     auto socks = find_forwarded_sockets();
     std::println("forwards       {} found", socks.size());
     for (auto& s : socks) std::println("  {}  {}", s.string(), unix_connect(s) ? "(live)" : "(dead)");
-    auto clip = paste_with_terminal(64 << 20);
+    auto clip = paste_with_terminal(c.max_bytes);
     if (!clip) {
         std::println("paste          FAILED: {}", clip.error().what);
         return 1;

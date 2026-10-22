@@ -4,12 +4,40 @@
 #include "rp/inband.hpp"
 #include "rp/io.hpp"
 
+#include <memory>
 #include <optional>
 #include <variant>
 
 namespace rp {
 
 inline constexpr std::uint64_t default_max_bytes = 256ull << 20;
+
+// How the terminal route talks to the terminal.
+enum class TerminalMode : std::uint8_t {
+    automatic,  // ask the terminal what it supports (OSC 5522, else OSC 52)
+    osc5522,    // assume OSC 5522 (images), for terminals that misreport it
+    osc52,      // OSC 52 only (text)
+    off,        // never ask the terminal
+};
+
+// What paste may do. agentty fills this from its settings (settings.json and
+// AGENTTY_PASTE_*) before the first paste; the defaults are agentty's.
+struct Config {
+    bool forwards = true;            // ssh-forwarded agents (/tmp/richpaste-<you>-*.sock)
+    bool display = true;             // this machine's own clipboard
+    bool server_display = false;     // over ssh, also try the server's own clipboard
+    TerminalMode terminal = TerminalMode::automatic;
+    bool decode_text = true;         // turn richpaste:1: lines in a paste back into files
+    std::uint64_t max_bytes = default_max_bytes;  // largest paste accepted
+    std::filesystem::path socket;    // ask only this agent socket (relays, tests)
+    std::filesystem::path save_dir;  // where pasted images/files are saved; empty: <state dir>/pasted
+    std::string token;               // token for a Windows agent at the end of a forward
+    std::uint16_t agent_port = 47233;  // Windows agent's loopback port (0 = any free one)
+};
+// The host may replace it at any time (a Settings change). Each call returns
+// a copy, so a paste that already started keeps the one it read.
+void set_config(Config c);
+auto config() -> Config;
 
 // How the host program names and re-runs itself. agentty sets this once at
 // startup, before any thread, so messages say `agentty paste setup` and the
@@ -20,6 +48,9 @@ struct Program {
     std::filesystem::path exe;            // empty: this executable
     std::vector<std::string> args{"paste"};  // put before the subcommand
     std::string default_command = "paste";   // run when no subcommand is given; empty: usage
+    // Lines the host adds to the usage text (its own subcommands).
+    std::string extra_usage =
+        "  agentty paste config       list and set the paste settings (Settings \xe2\x86\x92 Paste)\n";
     std::filesystem::path state_dir;      // agent socket, log, saved pastes; empty: ~/.agentty/paste
 };
 void set_program(Program p);
@@ -72,7 +103,7 @@ auto fetch(const Endpoint& e, std::uint64_t max_bytes, std::uint32_t hops = 0) -
 enum class Route { env_socket, forward, display, terminal };
 
 struct PasteOptions {
-    std::uint64_t max_bytes = default_max_bytes;
+    std::uint64_t max_bytes = config().max_bytes;
     // How to ask the terminal (OSC 5522 / 52). Unset = never ask it.
     // Nothing else may read the terminal during the call.
     std::optional<inband::Session> terminal;

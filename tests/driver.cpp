@@ -61,7 +61,17 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     platform_init();
     // Same as agentty's, except it re-runs itself as `rp_driver agent`, not `... paste agent`.
-    set_program({.name = "rp_driver", .exe = {}, .args = {}});
+    set_program({.name = "rp_driver", .exe = {}, .args = {}, .default_command = "paste", .extra_usage = ""});
+    // agentty feeds Config from its settings; the shell tests drive it with env.
+    Config c;
+    if (env("RICHPASTE_NO_DISPLAY")) c.display = false;
+    if (env("RICHPASTE_SERVER_CLIPBOARD")) c.server_display = true;
+    if (env("RICHPASTE_NO_TERMINAL")) c.terminal = TerminalMode::off;
+    if (auto t = env("RICHPASTE_TERMINAL")) c.terminal = *t == "5522" ? TerminalMode::osc5522 : TerminalMode::osc52;
+    if (auto s = env("RICHPASTE_SOCK")) c.socket = *s;
+    if (auto t = env("RICHPASTE_TOKEN")) c.token = *t;
+    if (auto p = env("RICHPASTE_PORT")) c.agent_port = static_cast<std::uint16_t>(std::stoi(*p));
+    set_config(std::move(c));
     if (!args.empty() && args[0] == "serve-file") return serve_file(args);
     if (!args.empty() && args[0] == "test-fetch-notoken") return fetch_notoken();
     return cli::run(args);

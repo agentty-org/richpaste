@@ -1,4 +1,5 @@
 #include "rp/clipboard.hpp"
+#include "rp/agent.hpp"   // config()
 #include "rp/io.hpp"
 
 #include <algorithm>
@@ -151,7 +152,7 @@ auto write_clipboard_text(std::string_view utf8) -> Result<void> {
 }
 
 auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
-    if (env("RICHPASTE_NO_DISPLAY")) return fail("no display server found (RICHPASTE_NO_DISPLAY is set)");
+    if (!config().display) return fail("no display server found (reading this machine's clipboard is turned off)");
 #if defined(_WIN32)
     auto r = win::read(max_bytes);
     if (!r) return std::unexpected(r.error());

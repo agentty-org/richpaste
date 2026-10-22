@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <mutex>
 #include <print>
 #include <thread>
 #ifndef _WIN32
@@ -68,7 +69,7 @@ auto connect(const Endpoint& e) -> Result<Fd> {
 auto token_of(const Endpoint& e) -> std::string {
     if (auto* t = std::get_if<TcpEndpoint>(&e)) return t->token;
     // A forwarded unix socket may end at a Windows agent that wants a token.
-    return env("RICHPASTE_TOKEN").value_or("");
+    return config().token;
 }
 
 // Errors that mean "nobody is listening there", as opposed to a real answer.
@@ -95,6 +96,7 @@ struct Attempt {
 };
 
 auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::optional<Result<Clip>> {
+    if (!config().forwards) return std::nullopt;
     for (auto& s : find_forwarded_sockets()) {
         auto r = fetch(UnixEndpoint{s}, max, hops);
         if (r) return Clip{std::move(*r), "ssh " + s.filename().string()};
@@ -112,6 +114,7 @@ auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::op
 }
 
 auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> {
+    if (!config().display) return std::nullopt;
     auto r = read_clipboard(max);
     if (r) return r;
     if (r.error().what.starts_with("no display server")) {
@@ -123,7 +126,7 @@ auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> 
 
 auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<Clip>> {
     if (!opt.terminal) return std::nullopt;
-    if (env("RICHPASTE_NO_TERMINAL")) return std::nullopt;
+    if (config().terminal == TerminalMode::off) return std::nullopt;
     inband::Session s = *opt.terminal;
     auto caps = inband::detect(s, Millis(1500));
     auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));
@@ -138,10 +141,10 @@ auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<
 }
 
 auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forwards) -> Result<Clip> {
-    if (auto s = env("RICHPASTE_SOCK")) {
-        auto r = fetch(UnixEndpoint{*s}, opt.max_bytes, hops);
+    if (auto s = config().socket; !s.empty()) {
+        auto r = fetch(UnixEndpoint{s}, opt.max_bytes, hops);
         if (!r) return std::unexpected(r.error());
-        return Clip{std::move(*r), "RICHPASTE_SOCK"};
+        return Clip{std::move(*r), "agent at " + s.string()};
     }
     Attempt a;
     if (prefer_forwards) {
@@ -150,7 +153,7 @@ auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forward
         if (auto r = from_terminal(opt, a)) return std::move(*r);
         // Don't fall back to this server's own display: that's not the clipboard you
         // copied into, and pasting it silently gives stale text.
-        if (env("RICHPASTE_SERVER_CLIPBOARD")) {
+        if (config().server_display) {
             if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
         }
         std::string why;
@@ -212,10 +215,31 @@ auto program_slot() -> Program& {
     static Program p;
     return p;
 }
+// A Config is small and swapped rarely; a mutex is portable everywhere
+// (std::atomic<shared_ptr> is missing from libc++, and the free atomic_load
+// overloads are deprecated in C++20).
+struct ConfigSlot {
+    std::mutex m;
+    Config c;
+};
+auto config_slot() -> ConfigSlot& {
+    static ConfigSlot s;
+    return s;
+}
 }  // namespace
 
 void set_program(Program p) { program_slot() = std::move(p); }
 auto program() -> const Program& { return program_slot(); }
+void set_config(Config c) {
+    auto& s = config_slot();
+    std::lock_guard g{s.m};
+    s.c = std::move(c);
+}
+auto config() -> Config {
+    auto& s = config_slot();
+    std::lock_guard g{s.m};
+    return s.c;
+}
 
 auto self_command(std::string_view sub) -> std::vector<std::string> {
     auto& p = program();
@@ -300,8 +324,7 @@ auto run_agent(Source source, bool quiet) -> Result<void> {
     auto lock = FileLock::try_lock(state_dir() / "agent.lock");
     if (!lock) return std::unexpected(lock.error());
     // A fixed port lets ssh's RemoteForward line stay the same; fall back to any port.
-    std::uint16_t want = 47233;
-    if (auto p = env("RICHPASTE_PORT")) want = static_cast<std::uint16_t>(std::stoi(*p));
+    std::uint16_t want = config().agent_port;
     auto l = tcp_listen_loopback(want);
     if (!l) l = tcp_listen_loopback(0);
     if (!l) return std::unexpected(l.error());
@@ -363,6 +386,7 @@ auto fetch(const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<s
 auto paste(const PasteOptions& opt) -> Result<Clip> {
     auto clip = paste_impl(opt, 0, in_ssh_session());
     if (!clip) return clip;
+    if (!config().decode_text) return clip;
     // Whatever route it came by, an image or file copied as text arrives as itself.
     std::vector<std::string> errors;
     clip->items = armor::expand(std::move(clip->items), &errors);

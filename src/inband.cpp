@@ -1,5 +1,6 @@
 #include "rp/inband.hpp"
 
+#include "rp/agent.hpp"   // config()
 #include "rp/clipboard.hpp"
 
 #include <algorithm>
@@ -249,9 +250,9 @@ auto detect(Session& s, Millis timeout) -> Caps {
         c.terminal = env("TERM_PROGRAM").or_else([] { return env("TERM"); }).value_or("");
     }
     s.caps = c;
-    // Override for terminals that misreport: RICHPASTE_TERMINAL=osc52 | 5522.
-    if (auto force = env("RICHPASTE_TERMINAL")) {
-        c.osc5522 = *force == "5522";
+    // A forced mode, for terminals that misreport (agentty: paste.terminal).
+    if (auto m = config().terminal; m == TerminalMode::osc5522 || m == TerminalMode::osc52) {
+        c.osc5522 = m == TerminalMode::osc5522;
         s.caps = c;
         return c;
     }
