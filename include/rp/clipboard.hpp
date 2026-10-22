@@ -19,6 +19,7 @@ auto choose(const Offer& offer, std::uint64_t max_bytes) -> Result<std::vector<I
 struct Clip {
     std::vector<Item> items;
     std::string source;  // e.g. "wayland wayland-1", "x11 :0"
+    Route route = Route::display;
 };
 
 // Reads this machine's clipboard directly (Wayland data-control, then X11).

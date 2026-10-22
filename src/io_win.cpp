@@ -113,7 +113,7 @@ auto tcp_connect_loopback(std::uint16_t port) -> Result<Fd> {
     a.sin_port = htons(port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == SOCKET_ERROR)
-        return fail("connect 127.0.0.1:{}: {}", port, wsa_str());
+        return fail(Code::unreachable, "connect 127.0.0.1:{}: {}", port, wsa_str());
     return fd;
 }
 

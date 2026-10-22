@@ -1,6 +1,7 @@
 #include "rp/agent.hpp"
 #include "rp/armor.hpp"
 #include "rp/cli.hpp"
+#include "rp/report.hpp"
 #include "rp/sha256.hpp"
 #include "rp/store.hpp"
 #include "rp/term.hpp"
@@ -45,10 +46,7 @@ auto usage() -> int {
     return 2;
 }
 
-auto paste_dir() -> fs::path {
-    if (auto d = config().save_dir; !d.empty()) return d;
-    return state_dir() / "pasted";
-}
+auto paste_dir() -> fs::path { return save_dir(); }
 
 void print_items(const Clip& clip, const fs::path& dir) {
     auto pasted = store(clip.items, dir);
@@ -65,15 +63,6 @@ void print_items(const Clip& clip, const fs::path& dir) {
     std::fflush(stdout);
 }
 
-// Pastes, asking the terminal as a last resort when we have one.
-auto paste_with_terminal(std::uint64_t max) -> Result<Clip> {
-    PasteOptions o;
-    o.max_bytes = max;
-    auto tty = config().terminal == TerminalMode::off ? Result<term::Tty>(fail("off")) : term::Tty::open();
-    if (tty) o.terminal = tty->session();
-    return paste(o);
-}
-
 auto cmd_paste(Args args) -> int {
     fs::path dir = paste_dir();
     for (std::size_t i = 1; i < args.size(); ++i) {
@@ -81,7 +70,7 @@ auto cmd_paste(Args args) -> int {
         if ((a == "-o" || a == "--out") && i + 1 < args.size()) dir = args[++i];
         else return usage();
     }
-    auto clip = paste_with_terminal(config().max_bytes);
+    auto clip = paste_here();
     if (!clip) {
         std::println(stderr, "{}: {}", program().name, clip.error().what);
         return 1;
@@ -90,76 +79,49 @@ auto cmd_paste(Args args) -> int {
     return 0;
 }
 
-auto terminal_name(TerminalMode m) -> std::string_view {
-    switch (m) {
-        case TerminalMode::automatic: return "auto";
-        case TerminalMode::osc5522: return "osc5522";
-        case TerminalMode::osc52: return "osc52";
-        case TerminalMode::off: return "off";
-    }
-    return "?";
-}
-
 auto cmd_doctor() -> int {
-    const auto c = config();
+    const auto d = diagnose();
+    const auto& c = d.config;
     std::println("settings       forwards={} display={} server_display={} terminal={} max={}",
                  c.forwards ? "on" : "off", c.display ? "on" : "off", c.server_display ? "on" : "off",
-                 terminal_name(c.terminal), human_size(c.max_bytes));
+                 terminal_mode_name(c.terminal), human_size(c.max_bytes));
     if (!c.socket.empty()) std::println("socket         {} (only this one is asked)", c.socket.string());
-    std::println("state dir      {}", state_dir().string());
-    std::println("saves to       {}", paste_dir().string());
-    auto ep = local_endpoint();
-    std::println("agent          {}  {}", ep ? describe(*ep) : "-", agent_alive() ? "(answering)" : "(not running)");
-    std::println("display env    WAYLAND_DISPLAY={} DISPLAY={}", env("WAYLAND_DISPLAY").value_or("-"),
-                 env("DISPLAY").value_or("-"));
-    std::println("ssh session    SSH_CONNECTION={}  TMUX={}", env("SSH_CONNECTION").value_or("-"),
-                 env("TMUX") ? "yes" : "no");
-    auto socks = find_forwarded_sockets();
-    std::println("forwards       {} found", socks.size());
-    for (auto& s : socks) std::println("  {}  {}", s.string(), unix_connect(s) ? "(live)" : "(dead)");
-    auto clip = paste_with_terminal(c.max_bytes);
-    if (!clip) {
-        std::println("paste          FAILED: {}", clip.error().what);
+    std::println("state dir      {}", d.state_dir.string());
+    std::println("saves to       {}", d.save_dir.string());
+    std::println("agent          {}  {}", d.agent, d.agent_alive ? "(answering)" : "(not running)");
+    std::println("display env    WAYLAND_DISPLAY={} DISPLAY={}", d.wayland_display.value_or("-"),
+                 d.x_display.value_or("-"));
+    std::println("ssh session    SSH_CONNECTION={}  TMUX={}", d.ssh_connection.value_or("-"), d.tmux ? "yes" : "no");
+    std::println("forwards       {} found", d.forwards.size());
+    for (auto& f : d.forwards) std::println("  {}  {}", f.socket.string(), f.live ? "(live)" : "(dead)");
+    std::string routes;
+    for (auto r : d.plan) routes += (routes.empty() ? "" : " -> ") + std::string{route_name(r)};
+    std::println("plan           {}{}{}", routes.empty() ? "(nothing enabled)" : routes, d.situation.ssh ? "  [ssh]" : "",
+                 d.situation.tmux ? "  [tmux]" : "");
+    if (!d.paste) {
+        auto& e = d.paste.error();
+        std::println("paste          FAILED ({}): {}", code_name(e.code), e.what);
+        for (auto& cause : e.causes)
+            std::println("  {:<12} {}", cause.route ? route_name(*cause.route) : "?", code_name(cause.code));
         return 1;
     }
-    std::println("paste          ok via {}", clip->source);
-    for (auto& i : clip->items)
+    std::println("paste          ok via {}", d.paste->source);
+    for (auto& i : d.paste->items)
         std::println("  {} {} sha256 {}", mime_of(i), human_size(payload(i).size()), hex(sha256(payload(i))).substr(0, 16));
     return 0;
 }
 
 auto cmd_setup() -> int {
-    auto cfg = home_dir() / ".ssh" / "config";
-    auto snippet = ssh_config_snippet();
-    std::string current;
-    if (auto b = read_file(cfg, 4 << 20)) current = as_string(*b);
-    // An older block may point at another binary (richpaste vs agentty paste),
-    // so swap it for ours instead of leaving it.
-    constexpr std::string_view end_mark = "# richpaste end\n";
-    auto a = current.find("# richpaste:");
-    auto b = a == std::string::npos ? a : current.find(end_mark, a);
-    if (b != std::string::npos && current.substr(a, b + end_mark.size() - a) == snippet) {
-        std::println("{} is already in {}", program().name, cfg.string());
-    } else {
-        if (auto d = ensure_private_dir(cfg.parent_path()); !d) {
-            std::println(stderr, "{}: {}", program().name, d.error().what);
-            return 1;
-        }
-        std::string out;
-        if (b != std::string::npos)
-            out = current.substr(0, a) + snippet + current.substr(b + end_mark.size());
-        else  // Match blocks must not end up inside someone's Host block, so prepend.
-            out = snippet + "\n" + current;
-        if (auto w = write_file_atomic(cfg, as_view(out)); !w) {
-            std::println(stderr, "{}: {}", program().name, w.error().what);
-            return 1;
-        }
-        std::println("{} {}:\n\n{}", b != std::string::npos ? "updated" : "added to the top of", cfg.string(), snippet);
-    }
-    if (auto r = ensure_agent(); !r) {
-        std::println(stderr, "{}: starting agent: {}", program().name, r.error().what);
+    auto r = setup();
+    if (!r) {
+        std::println(stderr, "{}: {}", program().name, r.error().what);
         return 1;
     }
+    if (r->change == SetupReport::Change::unchanged)
+        std::println("{} is already in {}", program().name, r->ssh_config.string());
+    else
+        std::println("{} {}:\n\n{}", r->change == SetupReport::Change::updated ? "updated" : "added to the top of",
+                     r->ssh_config.string(), r->snippet);
     std::println("agent is running. new ssh sessions will carry your clipboard.");
     std::println("the server needs {} too; nothing else to set up there.", program().name);
     return 0;

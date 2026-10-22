@@ -34,6 +34,7 @@ add_library(rp STATIC
   src/agent.cpp
   src/store.cpp
   src/term.cpp
+  src/report.cpp
   src/cli.cpp
 )
 target_include_directories(rp PUBLIC include)

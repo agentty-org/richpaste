@@ -293,7 +293,7 @@ auto read(const std::string& socket_path, std::uint64_t max_bytes) -> Result<std
     for (int i = 0; i < 3 && !s.selection; ++i)
         if (auto r = s.roundtrip(); !r) return std::unexpected(r.error());
     if (!s.selection) return fail("compositor never sent the selection");
-    if (*s.selection == 0) return fail("clipboard is empty");
+    if (*s.selection == 0) return fail(Code::empty, "clipboard is empty");
 
     auto it = s.offers.find(*s.selection);
     if (it == s.offers.end()) return fail("compositor sent an unknown selection offer");

@@ -1,5 +1,6 @@
 // Unit tests. No framework: each check prints and counts failures.
 
+#include "rp/agent.hpp"
 #include "rp/armor.hpp"
 #include "rp/clipboard.hpp"
 #include "rp/image.hpp"
@@ -120,8 +121,97 @@ void test_wire() {
     w2.put(ByteView(sha256(as_view("x"))));
     check(!wire::decode_response(std::move(w2).bytes()), "path traversal name rejected");
 
-    auto err = wire::decode_response(wire::encode_error("clipboard is empty"));
+    auto err = wire::decode_response(wire::encode_error("clipboard is empty", Code::empty));
     check(!err && err.error().what == "clipboard is empty", "error passes through");
+    check(!err && err.error().code == Code::empty, "error code passes through");
+
+    // An older agent sends no code byte.
+    wire::Writer old;
+    old.put_magic(wire::response_magic);
+    old.put(std::uint8_t{1});
+    old.put_str16("nope");
+    auto o = wire::decode_response(std::move(old).bytes());
+    check(!o && o.error().code == Code::other && o.error().what == "nope", "old agent error still reads");
+
+    check(!r || r.error().code == Code::corrupt, "corruption has its code");
+}
+
+void test_errors() {
+    Error e{Code::no_route, "x", {}, {}};
+    e.causes.push_back(Error{Code::unreachable, "a", {}, Route::forward});
+    e.causes.push_back(Error{Code::no_answer, "b", {}, Route::tmux_buffer});
+    check(e.any(Code::no_answer) && !e.any(Code::empty), "any() looks in causes");
+    check(e.from(Route::tmux_buffer) && e.from(Route::tmux_buffer)->what == "b", "from() finds the route");
+    check(!e.from(Route::display), "from() misses untried routes");
+    auto c = context(Error{Code::too_big, "big", {}, {}}, "tmux");
+    check(c.error().code == Code::too_big && c.error().what == "tmux: big", "context keeps the code");
+}
+
+void test_plan() {
+    Config c;
+    using V = std::vector<Route>;
+    check(plan({.ssh = false, .tmux = false}, c) == V{Route::display, Route::forward, Route::terminal}, "plan: local");
+    check(plan({.ssh = true, .tmux = false}, c) == V{Route::forward, Route::terminal}, "plan: ssh skips server display");
+    check(plan({.ssh = true, .tmux = true}, c) == V{Route::forward, Route::tmux_buffer, Route::terminal},
+          "plan: ssh + tmux");
+    c.server_display = true;
+    check(plan({.ssh = true, .tmux = false}, c).back() == Route::display, "plan: server_display last");
+    c.terminal = TerminalMode::off;
+    check(plan({.ssh = true, .tmux = true}, c) == V{Route::forward, Route::display}, "plan: terminal off drops tmux too");
+    c.socket = "/tmp/x.sock";
+    check(plan({.ssh = true, .tmux = true}, c) == V{Route::socket}, "plan: a set socket is the only route");
+}
+
+void test_progress() {
+    using S = armor::Progress::State;
+    Bytes img(3000);
+    for (std::size_t i = 0; i < img.size(); ++i) img[i] = std::byte(i * 11);
+    auto line = armor::encode(Image{*Mime::parse("image/png"), img});
+    check(armor::progress("plain text").state == S::none, "progress: none");
+    check(armor::progress(line).state == S::complete, "progress: whole line");
+    check(armor::progress(line + "\nmore").state == S::complete, "progress: text after");
+    check(armor::progress(line.substr(0, 20)).state == S::partial, "progress: header arriving");
+    auto half = armor::progress(line.substr(0, line.size() / 2));
+    check(half.state == S::partial && half.need == img.size() && half.have > 0 && half.have < img.size(),
+          "progress: half the data");
+    // Wrapped by a terminal: whitespace inside the data doesn't count.
+    std::string wrapped;
+    for (std::size_t i = 0; i < line.size(); i += 80) wrapped += line.substr(i, 80) + "\n";
+    check(armor::progress(wrapped).state == S::complete, "progress: wrapped line");
+    check(armor::progress(wrapped.substr(0, wrapped.size() - 200)).state == S::partial, "progress: wrapped, short");
+    // Cut and followed by other text: nothing more is coming for it.
+    check(armor::progress(line.substr(0, line.size() / 2) + "!? and then").state == S::complete,
+          "progress: cut block is final");
+    // Two blocks, the second still arriving.
+    check(armor::progress(line + " " + line.substr(0, 100)).state == S::partial, "progress: second block arriving");
+}
+
+void test_stripped() {
+    using S = inband::Stripped;
+    Bytes img(6000);
+    for (std::size_t i = 0; i < img.size(); ++i) img[i] = std::byte(i * 3);
+    std::string s = "]5522;type=read:status=OK\\";
+    for (std::size_t off = 0; off < img.size(); off += 4096) {
+        auto chunk = ByteView(img).subspan(off, std::min<std::size_t>(4096, img.size() - off));
+        s += "]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;" + base64_encode(chunk) + "\\";
+    }
+    std::string head = s;
+    s += "]5522;type=read:status=DONE\\";
+    check(inband::stripped_reply("hello") == S::none, "stripped: none");
+    check(inband::stripped_reply(head) == S::partial, "stripped: no DONE yet");
+    check(inband::stripped_reply(head.substr(0, head.size() - 30)) == S::partial, "stripped: mid packet");
+    check(inband::stripped_reply(s) == S::complete, "stripped: complete");
+    auto items = inband::decode_stripped_reply(s, 1 << 20);
+    check(items && items->size() == 1 && std::get<Image>((*items)[0]).data == img, "stripped: image back");
+    check(!inband::decode_stripped_reply(head, 1 << 20), "stripped: cut short fails");
+    auto big = inband::decode_stripped_reply(s, 100);
+    check(!big && big.error().code == Code::too_big, "stripped: size limit");
+    // BEL terminators, as some terminals send.
+    std::string bel = "]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;aGk=\x07]5522;type=read:status=DONE\x07";
+    auto t = inband::decode_stripped_reply(bel, 1 << 20);
+    check(t && std::get<Text>((*t)[0]).str() == "hi", "stripped: BEL terminated text");
+    auto perm = inband::decode_stripped_reply("]5522;type=read:status=EPERM\\", 1 << 20);
+    check(!perm && perm.error().code == Code::refused, "stripped: EPERM is refused");
 }
 
 void test_choose() {
@@ -264,6 +354,10 @@ int main() {
     test_sha256();
     test_types();
     test_wire();
+    test_errors();
+    test_plan();
+    test_progress();
+    test_stripped();
     test_choose();
     test_store();
     test_base64();

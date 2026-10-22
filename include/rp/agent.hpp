@@ -99,9 +99,6 @@ auto find_forwarded_sockets() -> std::vector<std::filesystem::path>;
 
 auto fetch(const Endpoint& e, std::uint64_t max_bytes, std::uint32_t hops = 0) -> Result<std::vector<Item>>;
 
-// Where a paste may come from, in the order tried.
-enum class Route { env_socket, forward, display, terminal };
-
 struct PasteOptions {
     std::uint64_t max_bytes = config().max_bytes;
     // How to ask the terminal (OSC 5522 / 52). Unset = never ask it.
@@ -113,9 +110,25 @@ struct PasteOptions {
     int tmux_timeout_ms = 8000;
 };
 
+// What paste() looks at to pick its routes. sense() reads it from this
+// process (env, tmux); tests build one by hand.
+struct Situation {
+    bool ssh = false;   // we run inside an ssh session
+    bool tmux = false;  // inside a live tmux pane, and opt.tmux_buffer is on
+};
+auto sense(const PasteOptions& opt) -> Situation;
+
+// The routes paste() tries, in order, for a situation and config. Pure.
+// Over ssh the clipboard you copied into is on the machine you type on, so
+// forwards and the terminal come first, and this server's display only if
+// Config::server_display says so. Locally the display comes first.
+auto plan(const Situation& s, const Config& c) -> std::vector<Route>;
+
 // The one call an app needs: finds the right clipboard and returns what's on it.
-// Order: $RICHPASTE_SOCK, ssh forwards (newest first), this machine's display,
-// then the terminal itself. Inside ssh, forwards come before the display.
+// Walks plan(sense(opt), config()). Every failure carries a Code; when no
+// route gave an answer the code is no_route and `causes` has one per route,
+// or needs_terminal if the only thing left was asking the terminal and
+// `opt.terminal` was unset (the app can ask it itself, through its own input).
 auto paste(const PasteOptions& opt = {}) -> Result<Clip>;
 
 // ---- ssh glue ----

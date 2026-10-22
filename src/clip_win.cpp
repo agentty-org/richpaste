@@ -55,7 +55,7 @@ private:
 auto global_bytes(HANDLE h, std::size_t max) -> Result<Bytes> {
     if (!h) return fail("no data");
     auto size = ::GlobalSize(h);
-    if (size > max) return fail("clipboard data is larger than the {} limit", human_size(max));
+    if (size > max) return fail(Code::too_big, "clipboard data is larger than the {} limit", human_size(max));
     auto* p = static_cast<const std::byte*>(::GlobalLock(h));
     if (!p) return fail("could not lock clipboard data");
     Bytes out(p, p + size);
@@ -86,7 +86,7 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
 
     std::vector<UINT> formats;
     for (UINT f = ::EnumClipboardFormats(0); f; f = ::EnumClipboardFormats(f)) formats.push_back(f);
-    if (formats.empty()) return fail("clipboard is empty");
+    if (formats.empty()) return fail(Code::empty, "clipboard is empty");
     auto has = [&](UINT f) { return std::ranges::contains(formats, f); };
     UINT png = ::RegisterClipboardFormatW(L"PNG");
     UINT png_mime = ::RegisterClipboardFormatW(L"image/png");
@@ -132,7 +132,7 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
         auto img = image::decode_dib(*dib);
         if (!img) continue;
         auto out = image::encode_png(*img);
-        if (out.size() > max_bytes) return fail("image is larger than the {} limit", human_size(max_bytes));
+        if (out.size() > max_bytes) return fail(Code::too_big, "image is larger than the {} limit", human_size(max_bytes));
         return std::vector<Item>{Image{*Mime::parse("image/png"), std::move(out)}};
     }
 
@@ -151,7 +151,7 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
         list += format_name(f);
         if (list.size() > 200) break;
     }
-    return fail("nothing pasteable on the clipboard (offered: {})", list);
+    return fail(Code::empty, "nothing pasteable on the clipboard (offered: {})", list);
 }
 
 auto write_text(std::string_view text) -> Result<void> {

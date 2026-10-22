@@ -26,6 +26,20 @@ struct Split {
 // Pulls every armored block out of pasted text. Plain text around them is kept.
 auto split(std::string_view text) -> Split;
 
+// How much of the armored text has arrived, for text that comes in pieces
+// (a paste read by read, a slow link). Cheap: no decoding.
+struct Progress {
+    enum class State : std::uint8_t {
+        none,      // no armored block in the text
+        partial,   // a block is still arriving; wait for more
+        complete,  // every block has all its data (or is broken): split() now gives the final answer
+    };
+    State state = State::none;
+    std::uint64_t have = 0;  // data bytes of the first unfinished block received so far
+    std::uint64_t need = 0;  // its full size; 0 while its header is still arriving
+};
+auto progress(std::string_view text) -> Progress;
+
 // Replaces any Text item that carries armored blocks with the items inside it.
 // Every paste route runs this, so an image copied as text arrives as the image.
 auto expand(std::vector<Item> items, std::vector<std::string>* errors = nullptr) -> std::vector<Item>;

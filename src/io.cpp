@@ -25,7 +25,7 @@ auto read_all(int fd, std::size_t max, Millis idle_timeout) -> Result<Bytes> {
         auto n = read_some(fd, buf, idle_timeout);
         if (!n) return std::unexpected(n.error());
         if (*n == 0) return out;
-        if (out.size() + *n > max) return fail("data is larger than the {} limit", human_size(max));
+        if (out.size() + *n > max) return fail(Code::too_big, "data is larger than the {} limit", human_size(max));
         out.insert(out.end(), buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(*n));
     }
 }

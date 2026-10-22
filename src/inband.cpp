@@ -60,13 +60,13 @@ auto ReadReply::add(const Packet& p, std::uint64_t max_bytes) -> Result<bool> {
     if (p.status == "DONE") return true;
     if (p.status == "DATA") {
         total_ += p.data.size();
-        if (total_ > max_bytes) return fail("clipboard is larger than the {} limit", human_size(max_bytes));
+        if (total_ > max_bytes) return fail(Code::too_big, "clipboard is larger than the {} limit", human_size(max_bytes));
         if (parts_.empty() || parts_.back().first != p.mime) parts_.emplace_back(p.mime, Bytes{});
         auto& b = parts_.back().second;
         b.insert(b.end(), p.data.begin(), p.data.end());
         return false;
     }
-    if (p.status == "EPERM") return fail("the terminal refused clipboard access");
+    if (p.status == "EPERM") return fail(Code::refused, "the terminal refused clipboard access");
     if (p.status == "ENOSYS") return fail("the terminal has no clipboard here");
     if (p.status == "EBUSY") return fail("the clipboard is busy, try again");
     return fail("terminal clipboard error {}", p.status);
@@ -219,10 +219,10 @@ auto exchange(const Session& s, std::string_view q, Millis timeout, F&& on_reply
     auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         auto left = std::chrono::duration_cast<Millis>(deadline - std::chrono::steady_clock::now());
-        if (left.count() <= 0) return fail("terminal did not answer");
+        if (left.count() <= 0) return fail(Code::no_answer, "terminal did not answer");
         auto n = s.read(buf, left);
-        if (!n) return fail("terminal did not answer");
-        if (*n == 0) return fail("terminal closed");
+        if (!n) return fail(Code::no_answer, "terminal did not answer");
+        if (*n == 0) return fail(Code::no_answer, "terminal closed");
         sc.feed(std::span(buf).first(*n));
         while (auto r = sc.next()) {
             if (r->kind == Kind5::da1) return {};
@@ -283,7 +283,7 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
         if (!r) return std::unexpected(r.error());
         if (err) return std::unexpected(*err);
         auto offered = listing.mimes();
-        if (offered.empty()) return fail("clipboard is empty");
+        if (offered.empty()) return fail(Code::empty, "clipboard is empty");
         auto want = choose_mimes(offered);
         ReadReply data;
         r = exchange(s, query_5522_read(want), timeout, [&](const Reply& rep) -> Result<void> {
@@ -307,7 +307,7 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
         auto t = tmux_refresh_clipboard(timeout);
         if (t && !t->empty()) return std::vector<Item>{Text::repair(*t)};
         if (!t) return std::unexpected(t.error());
-        return fail("clipboard is empty");
+        return fail(Code::empty, "clipboard is empty");
     }
     std::string text;
     bool got = false;
@@ -318,14 +318,14 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
         if (b64 == "?") return {};
         auto d = base64_decode(b64);
         if (!d) return std::unexpected(d.error());
-        if (d->size() > max_bytes) return fail("clipboard is larger than the {} limit", human_size(max_bytes));
+        if (d->size() > max_bytes) return fail(Code::too_big, "clipboard is larger than the {} limit", human_size(max_bytes));
         text = as_string(*d);
         got = true;
         return {};
     });
     if (!r) return std::unexpected(r.error());
-    if (!got) return fail("the terminal didn't answer a clipboard read (OSC 52 reads are off or unsupported)");
-    if (text.empty()) return fail("clipboard is empty");
+    if (!got) return fail(Code::no_answer, "the terminal didn't answer a clipboard read (OSC 52 reads are off or unsupported)");
+    if (text.empty()) return fail(Code::empty, "clipboard is empty");
     return std::vector<Item>{Text::repair(text)};
 }
 
@@ -391,7 +391,55 @@ auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string> {
         }
         std::this_thread::sleep_for(Millis(50));
     }
-    return fail("the terminal outside tmux didn't answer a clipboard read (OSC 52 reads are off or unsupported)");
+    return fail(Code::no_answer, "the terminal outside tmux didn't answer a clipboard read (OSC 52 reads are off or unsupported)");
+}
+
+namespace {
+
+constexpr std::string_view stripped_intro = "]5522;type=read:";
+
+// Calls f(body) for each terminated packet until f returns false.
+template <class F>
+void each_stripped(std::string_view s, F&& f) {
+    for (auto at = s.find(stripped_intro); at != std::string_view::npos; at = s.find(stripped_intro, at + 1)) {
+        auto from = at + 6;  // past "]5522;"
+        // Neither meta nor base64 has these; ']' starts the next packet.
+        auto end = s.find_first_of("\\\x07]\x1b", from);
+        if (end == std::string_view::npos || !f(s.substr(from, end - from))) return;
+    }
+}
+
+}  // namespace
+
+auto stripped_reply(std::string_view text) -> Stripped {
+    if (!text.contains(stripped_intro)) return Stripped::none;
+    bool done = false;
+    each_stripped(text, [&](std::string_view body) {
+        auto p = parse_5522(body);
+        if (p && p->status != "OK" && p->status != "DATA") done = true;
+        return !done;
+    });
+    return done ? Stripped::complete : Stripped::partial;
+}
+
+auto decode_stripped_reply(std::string_view text, std::uint64_t max_bytes) -> Result<std::vector<Item>> {
+    ReadReply reply;
+    std::optional<Error> err;
+    bool done = false;
+    each_stripped(text, [&](std::string_view body) {
+        auto p = parse_5522(body);
+        if (!p) {
+            err = Error{Code::corrupt, p.error().what, {}, {}};
+            return false;
+        }
+        auto r = reply.add(*p, max_bytes);
+        if (!r) err = r.error();
+        done = !r || *r;
+        return !done;
+    });
+    if (err) return std::unexpected(*err);
+    if (!done) return fail(Code::corrupt, "clipboard reply was cut short");
+    return reply.items();
 }
 
 }  // namespace rp::inband

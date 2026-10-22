@@ -170,6 +170,45 @@ auto ext_for_mime(std::string_view mime) -> std::string_view {
     return "bin";
 }
 
+auto code_name(Code c) -> std::string_view {
+    switch (c) {
+        case Code::other: return "other";
+        case Code::empty: return "empty";
+        case Code::too_big: return "too_big";
+        case Code::refused: return "refused";
+        case Code::no_answer: return "no_answer";
+        case Code::unreachable: return "unreachable";
+        case Code::no_display: return "no_display";
+        case Code::corrupt: return "corrupt";
+        case Code::no_route: return "no_route";
+        case Code::needs_terminal: return "needs_terminal";
+    }
+    return "other";
+}
+
+auto Error::any(Code c) const -> bool {
+    if (code == c) return true;
+    return std::ranges::any_of(causes, [c](const Error& e) { return e.any(c); });
+}
+
+auto Error::from(Route r) const -> const Error* {
+    if (route == r) return this;
+    for (auto& e : causes)
+        if (auto* f = e.from(r)) return f;
+    return nullptr;
+}
+
+auto route_name(Route r) -> std::string_view {
+    switch (r) {
+        case Route::socket: return "socket";
+        case Route::forward: return "forward";
+        case Route::display: return "display";
+        case Route::tmux_buffer: return "tmux_buffer";
+        case Route::terminal: return "terminal";
+    }
+    return "?";
+}
+
 auto human_size(std::uint64_t n) -> std::string {
     constexpr std::array units{"B", "KB", "MB", "GB", "TB"};
     double v = static_cast<double>(n);

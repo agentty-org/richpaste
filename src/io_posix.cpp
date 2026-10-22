@@ -119,7 +119,7 @@ auto unix_connect(const fs::path& path) -> Result<Fd> {
     auto fd = new_socket(AF_UNIX);
     if (!fd) return fd;
     if (::connect(fd->get(), reinterpret_cast<sockaddr*>(&*addr), sizeof(*addr)) < 0)
-        return fail("connect {}: {}", path.native(), errno_str());
+        return fail(Code::unreachable, "connect {}: {}", path.native(), errno_str());
     return fd;
 }
 
@@ -148,7 +148,7 @@ auto tcp_connect_loopback(std::uint16_t port) -> Result<Fd> {
     a.sin_port = htons(port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(fd->get(), reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0)
-        return fail("connect 127.0.0.1:{}: {}", port, errno_str());
+        return fail(Code::unreachable, "connect 127.0.0.1:{}: {}", port, errno_str());
     return fd;
 }
 

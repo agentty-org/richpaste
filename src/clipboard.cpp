@@ -130,14 +130,14 @@ auto choose(const Offer& offer, std::uint64_t max_bytes) -> Result<std::vector<I
         return std::vector<Item>{std::move(text)};
     }
 
-    if (offer.targets.empty()) return fail("clipboard is empty");
+    if (offer.targets.empty()) return fail(Code::empty, "clipboard is empty");
     std::string list;
     for (auto& t : offer.targets) {
         if (!list.empty()) list += ", ";
         list += t;
         if (list.size() > 200) break;
     }
-    return fail("nothing pasteable on the clipboard (offered: {})", list);
+    return fail(Code::empty, "nothing pasteable on the clipboard (offered: {})", list);
 }
 
 auto has_display_env() -> bool { return env("WAYLAND_DISPLAY") || env("DISPLAY"); }
@@ -152,7 +152,7 @@ auto write_clipboard_text(std::string_view utf8) -> Result<void> {
 }
 
 auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
-    if (!config().display) return fail("no display server found (reading this machine's clipboard is turned off)");
+    if (!config().display) return fail(Code::no_display, "no display server found (reading this machine's clipboard is turned off)");
 #if defined(_WIN32)
     auto r = win::read(max_bytes);
     if (!r) return std::unexpected(r.error());
@@ -189,7 +189,7 @@ auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
         if (r) return Clip{std::move(*r), "wayland " + fs::path(sock).filename().string()};
         errors.push_back(std::format("wayland {}: {}", sock, r.error().what));
         // An empty clipboard is an answer, not a backend failure.
-        if (r.error().what == "clipboard is empty") return std::unexpected(r.error());
+        if (r.error().code == Code::empty) return std::unexpected(r.error());
     }
 
     // X11: $DISPLAY first, then any local X server socket.
@@ -209,13 +209,14 @@ auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
         auto r = x11::read(d, max_bytes);
         if (r) return Clip{std::move(*r), "x11 " + d};
         errors.push_back(std::format("x11 {}: {}", d, r.error().what));
-        if (r.error().what == "clipboard is empty") return std::unexpected(r.error());
+        if (r.error().code == Code::empty) return std::unexpected(r.error());
     }
 
-    if (errors.empty()) return fail("no display server found (no Wayland or X11 session on this machine)");
+    if (errors.empty()) return fail(Code::no_display, "no display server found (no Wayland or X11 session on this machine)");
     std::string all;
     for (auto& e : errors) all += (all.empty() ? "" : "; ") + e;
-    return fail("{}", all);
+    // Every display we found failed to answer: as good as none.
+    return fail(Code::no_display, "{}", all);
 #endif
 }
 

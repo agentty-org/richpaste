@@ -70,4 +70,15 @@ auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -
 // Asks tmux to fetch the outer terminal's clipboard (OSC 52) and returns the text.
 auto tmux_refresh_clipboard(Millis timeout) -> Result<std::string>;
 
+// An OSC 5522 read reply that lost its ESC bytes on the way (some tmux / ssh
+// setups), so it reached the app as typed text: "]5522;type=read:status=DATA:..."
+enum class Stripped : std::uint8_t {
+    none,      // no such reply in the text
+    partial,   // one has started; hold the text back until it ends
+    complete,  // its DONE (or an error) packet is here
+};
+auto stripped_reply(std::string_view text) -> Stripped;
+// The items a complete stripped reply carried, chosen like any other read.
+auto decode_stripped_reply(std::string_view text, std::uint64_t max_bytes) -> Result<std::vector<Item>>;
+
 }  // namespace rp::inband

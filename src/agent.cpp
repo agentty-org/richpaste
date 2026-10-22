@@ -42,10 +42,11 @@ namespace {
 }
 
 auto encode_clip(const Result<Clip>& clip, std::uint64_t max) -> Bytes {
-    if (!clip) return wire::encode_error(clip.error().what);
+    if (!clip) return wire::encode_error(clip.error().what, clip.error().code);
     std::uint64_t total = 0;
     for (auto& i : clip->items) total += wire::encoded_size(i);
-    if (total > max) return wire::encode_error(std::format("clipboard is {} (limit {})", human_size(total), human_size(max)));
+    if (total > max)
+        return wire::encode_error(std::format("clipboard is {} (limit {})", human_size(total), human_size(max)), Code::too_big);
     return wire::encode_items(clip->items);
 }
 
@@ -72,11 +73,20 @@ auto token_of(const Endpoint& e) -> std::string {
     return config().token;
 }
 
-// Errors that mean "nobody is listening there", as opposed to a real answer.
-auto unreachable(const Error& e) -> bool {
-    auto& w = e.what;
-    return w.starts_with("connect") || w.starts_with("sending") || w.starts_with("reading reply") ||
-           w.starts_with("agent on your machine");
+// Sends one request on an open connection and reads the answer. Any failure
+// to talk is `unreachable`; an answer keeps the agent's own code.
+auto exchange(Fd fd, const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<std::vector<Item>> {
+    auto req = wire::encode_request({wire::Op::clipboard, max, hops, token_of(e)});
+    if (auto w = write_all(fd.get(), req, Millis(5000)); !w)
+        return fail(Code::unreachable, "sending request: {}", w.error().what);
+    // Idle timeout covers the agent reading the clipboard and slow links.
+    auto resp = read_all(fd.get(), static_cast<std::size_t>(max) + (1u << 20), Millis(30000));
+    if (!resp) {
+        if (resp.error().code == Code::too_big) return std::unexpected(resp.error());
+        return fail(Code::unreachable, "reading reply: {}", resp.error().what);
+    }
+    if (resp->empty()) return fail(Code::unreachable, "agent on your machine isn't running (forward closed with no reply)");
+    return wire::decode_response(*resp);
 }
 
 // Inside ssh? Asks tmux too, since an old pane keeps stale env.
@@ -91,10 +101,6 @@ auto in_ssh_session() -> bool {
     return env("SSH_CONNECTION") || env("SSH_TTY");
 }
 
-struct Attempt {
-    std::vector<std::string> errors;
-};
-
 // A live tmux pane we can ask things of. $TMUX alone can be stale.
 auto in_tmux_pane() -> bool {
     if (!env("TMUX") || !env("TMUX_PANE")) return false;
@@ -102,98 +108,121 @@ auto in_tmux_pane() -> bool {
     return run_capture(q, Millis(1000)).has_value();
 }
 
-auto from_forwards(std::uint64_t max, std::uint32_t hops, Attempt& a) -> std::optional<Result<Clip>> {
-    if (!config().forwards) return std::nullopt;
+auto tagged(Error e, Route r) -> Error {
+    e.route = r;
+    return e;
+}
+
+// A failure that means "this route has nothing to say", so the next one is
+// tried. Anything else (empty, too big, refused, corrupt) is the answer.
+auto moves_on(Route r, Code c) -> bool {
+    // tmux only fetches text (OSC 52) and can fail for its own reasons; the
+    // terminal may still answer, with an image even.
+    if (r == Route::tmux_buffer) return c != Code::too_big;
+    switch (c) {
+        case Code::unreachable:
+        case Code::no_display:
+        case Code::no_answer:
+        case Code::needs_terminal:
+        case Code::no_route: return true;
+        default: return false;
+    }
+}
+
+auto from_socket(const PasteOptions& opt, std::uint32_t hops) -> Result<Clip> {
+    auto s = config().socket;
+    auto r = fetch(UnixEndpoint{s}, opt.max_bytes, hops);
+    if (!r) return std::unexpected(r.error());
+    return Clip{std::move(*r), "agent at " + s.string(), Route::socket};
+}
+
+auto from_forwards(const PasteOptions& opt, std::uint32_t hops) -> Result<Clip> {
+    std::vector<Error> tried;
     for (auto& s : find_forwarded_sockets()) {
-        auto r = fetch(UnixEndpoint{s}, max, hops);
-        if (r) return Clip{std::move(*r), "ssh " + s.filename().string()};
-        // A dead forward leaves its socket file behind; clear it.
-        if (r.error().what.contains("Connection refused")) {
+        Endpoint e = UnixEndpoint{s};
+        auto fd = connect(e);
+        if (!fd) {
+            // A dead forward leaves its socket file behind; clear it.
             std::error_code ec;
             fs::remove(s, ec);
             continue;
         }
-        // The agent answered with a real error (empty clipboard, too big). That's the answer.
-        if (!unreachable(r.error())) return std::unexpected(r.error());
-        a.errors.push_back(std::format("{}: {}", s.filename().string(), r.error().what));
+        auto r = exchange(std::move(*fd), e, opt.max_bytes, hops);
+        if (r) return Clip{std::move(*r), "ssh " + s.filename().string(), Route::forward};
+        if (r.error().code != Code::unreachable) return std::unexpected(r.error());
+        tried.push_back(context(r.error(), s.filename().string()).error());
     }
-    return std::nullopt;
+    if (tried.empty()) return fail(Code::unreachable, "no ssh forward from your machine (run `{} setup` there)", program().name);
+    Error e{Code::unreachable, tried.front().what, {}, {}};
+    for (std::size_t i = 1; i < tried.size(); ++i) e.what += "; " + tried[i].what;
+    return std::unexpected(std::move(e));
 }
 
-auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> {
-    if (!config().display) return std::nullopt;
-    auto r = read_clipboard(max);
-    if (r) return r;
-    if (r.error().what.starts_with("no display server")) {
-        a.errors.push_back(r.error().what);
-        return std::nullopt;
-    }
+auto from_display(const PasteOptions& opt) -> Result<Clip> {
+    auto r = read_clipboard(opt.max_bytes);
+    if (r) r->route = Route::display;
     return r;
 }
 
-auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<Clip>> {
-    if (config().terminal == TerminalMode::off) return std::nullopt;
-    // Inside tmux, let tmux fetch the outer terminal's clipboard into a paste
-    // buffer and read that buffer directly. The reply never passes through
-    // our input (where keyboard modes like extended-keys, slow links and
-    // stray terminal reports can mangle a big reply), and it works with no
-    // tty of our own. Text only, but a richpaste:1: line in it becomes the
-    // image or file in paste().
-    if (opt.tmux_buffer && in_tmux_pane()) {
-        auto t = inband::tmux_refresh_clipboard(Millis(opt.tmux_timeout_ms));
-        if (t && !t->empty()) {
-            if (t->size() > opt.max_bytes) return fail("clipboard is larger than the {} limit", human_size(opt.max_bytes));
-            return Clip{{Text::repair(*t)}, "terminal via tmux buffer"};
-        }
-        a.errors.push_back(std::format("tmux: {}", t ? std::string{"clipboard is empty"} : t.error().what));
-    }
-    if (!opt.terminal) return std::nullopt;
+// tmux fetches the outer terminal's clipboard into a paste buffer and we read
+// that buffer. The reply never passes through our input (where keyboard modes
+// like extended-keys, slow links and stray terminal reports mangle a big
+// reply), and no tty is needed. Text only; a richpaste:1: line in it becomes
+// the image or file in paste().
+auto from_tmux_buffer(const PasteOptions& opt) -> Result<Clip> {
+    auto t = inband::tmux_refresh_clipboard(Millis(opt.tmux_timeout_ms));
+    if (!t) return std::unexpected(t.error());
+    if (t->empty()) return fail(Code::empty, "clipboard is empty");
+    if (t->size() > opt.max_bytes) return fail(Code::too_big, "clipboard is larger than the {} limit", human_size(opt.max_bytes));
+    return Clip{{Text::repair(*t)}, "terminal via tmux buffer", Route::tmux_buffer};
+}
+
+auto from_terminal(const PasteOptions& opt) -> Result<Clip> {
+    if (!opt.terminal) return fail(Code::needs_terminal, "no terminal session to ask");
     inband::Session s = *opt.terminal;
     auto caps = inband::detect(s, Millis(1500));
     auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));
+    if (!r) return context(r.error(), caps.terminal.empty() ? "terminal" : "terminal " + caps.terminal);
     auto via = caps.osc5522 ? "terminal (OSC 5522)" : caps.tmux ? "terminal via tmux (OSC 52)" : "terminal (OSC 52)";
-    if (r) return Clip{std::move(*r), via};
-    // "Empty" and "refused" are answers; "didn't answer" means try nothing else here.
-    if (r.error().what.contains("didn't answer") || r.error().what.contains("did not answer")) {
-        a.errors.push_back(std::format("terminal{}: {}", caps.terminal.empty() ? "" : " " + caps.terminal, r.error().what));
-        return std::nullopt;
-    }
-    return std::unexpected(r.error());
+    return Clip{std::move(*r), via, Route::terminal};
 }
 
-auto paste_impl(const PasteOptions& opt, std::uint32_t hops, bool prefer_forwards) -> Result<Clip> {
-    if (auto s = config().socket; !s.empty()) {
-        auto r = fetch(UnixEndpoint{s}, opt.max_bytes, hops);
-        if (!r) return std::unexpected(r.error());
-        return Clip{std::move(*r), "agent at " + s.string()};
+auto try_route(Route r, const PasteOptions& opt, std::uint32_t hops) -> Result<Clip> {
+    switch (r) {
+        case Route::socket: return from_socket(opt, hops);
+        case Route::forward: return from_forwards(opt, hops);
+        case Route::display: return from_display(opt);
+        case Route::tmux_buffer: return from_tmux_buffer(opt);
+        case Route::terminal: return from_terminal(opt);
     }
-    Attempt a;
-    if (prefer_forwards) {
-        if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
-        // Over ssh, the terminal sits on the machine you type on, so ask it.
-        if (auto r = from_terminal(opt, a)) return std::move(*r);
-        // Don't fall back to this server's own display: that's not the clipboard you
-        // copied into, and pasting it silently gives stale text.
-        if (config().server_display) {
-            if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
-        }
-        std::string why;
-        for (auto& e : a.errors) why += "\n  " + e;
-        return fail(
-            "can't reach the clipboard on the machine you're typing on.{}\n"
-            "Run `{} setup` on that machine (your laptop), then reconnect.",
-            why, program().name);
-    } else {
-        if (auto r = from_display(opt.max_bytes, a)) return std::move(*r);
-        if (auto r = from_forwards(opt.max_bytes, hops, a)) return std::move(*r);
-        if (auto r = from_terminal(opt, a)) return std::move(*r);
+    return fail("unknown route");
+}
+
+auto walk(const std::vector<Route>& routes, const PasteOptions& opt, std::uint32_t hops, bool remote) -> Result<Clip> {
+    std::vector<Error> causes;
+    for (auto route : routes) {
+        auto r = try_route(route, opt, hops);
+        if (r) return r;
+        auto e = tagged(std::move(r.error()), route);
+        if (!moves_on(route, e.code)) return std::unexpected(std::move(e));
+        causes.push_back(std::move(e));
     }
     std::string why;
-    for (auto& e : a.errors) why += "\n  " + e;
-    return fail(
-        "can't reach a clipboard.{}\n"
-        "Run `{} setup` on the machine you type on, then reconnect.",
-        why, program().name);
+    for (auto& e : causes) why += std::format("\n  {}: {}", route_name(*e.route), e.what);
+    // Only the terminal is left and we may not ask it: the caller can, through
+    // its own input.
+    const bool ask_terminal = std::ranges::any_of(causes, [](auto& e) { return e.code == Code::needs_terminal; });
+    Error out{ask_terminal ? Code::needs_terminal : Code::no_route, "", std::move(causes), {}};
+    out.what = remote ? std::format("can't reach the clipboard on the machine you're typing on.{}\n"
+                                    "Run `{} setup` on that machine (your laptop), then reconnect.",
+                                    why, program().name)
+                      : std::format("can't reach a clipboard.{}\nRun `{} setup` on the machine you type on, then reconnect.",
+                                    why, program().name);
+    return std::unexpected(std::move(out));
+}
+
+auto paste_impl(const PasteOptions& opt, std::uint32_t hops, const Situation& s) -> Result<Clip> {
+    return walk(plan(s, config()), opt, hops, s.ssh);
 }
 
 [[maybe_unused]] auto parse_tcp_info(std::string_view s) -> Result<TcpEndpoint> {
@@ -280,7 +309,7 @@ auto ssh_forward_conf() -> fs::path { return state_dir() / "ssh"; }
 auto local_endpoint() -> Result<Endpoint> {
 #ifdef _WIN32
     auto b = read_file(tcp_info_path(), 4096);
-    if (!b) return fail("agent is not running");
+    if (!b) return fail(Code::unreachable, "agent is not running");
     auto t = parse_tcp_info(as_string(*b));
     if (!t) return std::unexpected(t.error());
     return Endpoint{*t};
@@ -308,11 +337,11 @@ void serve_one(int fd, const Source& source, std::string_view token, bool quiet)
     auto r = wire::decode_request(req);
     Bytes out;
     if (!r) {
-        out = wire::encode_error(r.error().what);
+        out = wire::encode_error(r.error().what, Code::corrupt);
     } else if (!token.empty() && !same(r->token, token) && !peer_is_same_user(fd)) {
         // Windows: loopback TCP is open to every local user, so require the token
         // unless the caller is this same Windows user (ssh.exe forwards run as you).
-        out = wire::encode_error("wrong agent token");
+        out = wire::encode_error("wrong agent token", Code::refused);
         if (!quiet) std::println(stderr, "{}: refused a request with a wrong token", program().name);
     } else {
         auto clip = source(r->max_total_bytes, r->hops + 1);
@@ -395,23 +424,44 @@ auto find_forwarded_sockets() -> std::vector<fs::path> {
 auto fetch(const Endpoint& e, std::uint64_t max, std::uint32_t hops) -> Result<std::vector<Item>> {
     auto fd = connect(e);
     if (!fd) return std::unexpected(fd.error());
-    auto req = wire::encode_request({wire::Op::clipboard, max, hops, token_of(e)});
-    if (auto w = write_all(fd->get(), req, Millis(5000)); !w) return fail("sending request: {}", w.error().what);
-    // Idle timeout covers the agent reading the clipboard and slow links.
-    auto resp = read_all(fd->get(), static_cast<std::size_t>(max) + (1u << 20), Millis(30000));
-    if (!resp) return fail("reading reply: {}", resp.error().what);
-    if (resp->empty()) return fail("agent on your machine isn't running (forward closed with no reply)");
-    return wire::decode_response(*resp);
+    return exchange(std::move(*fd), e, max, hops);
+}
+
+auto sense(const PasteOptions& opt) -> Situation {
+    return {.ssh = in_ssh_session(), .tmux = opt.tmux_buffer && in_tmux_pane()};
+}
+
+auto plan(const Situation& s, const Config& c) -> std::vector<Route> {
+    if (!c.socket.empty()) return {Route::socket};
+    const bool term = c.terminal != TerminalMode::off;
+    std::vector<Route> out;
+    auto add = [&](bool on, Route r) {
+        if (on) out.push_back(r);
+    };
+    if (s.ssh) {
+        add(c.forwards, Route::forward);
+        add(term && s.tmux, Route::tmux_buffer);
+        add(term, Route::terminal);
+        // This server's own clipboard isn't the one you copied into, so only
+        // when asked for.
+        add(c.display && c.server_display, Route::display);
+    } else {
+        add(c.display, Route::display);
+        add(c.forwards, Route::forward);
+        add(term && s.tmux, Route::tmux_buffer);
+        add(term, Route::terminal);
+    }
+    return out;
 }
 
 auto paste(const PasteOptions& opt) -> Result<Clip> {
-    auto clip = paste_impl(opt, 0, in_ssh_session());
+    auto clip = paste_impl(opt, 0, sense(opt));
     if (!clip) return clip;
     if (!config().decode_text) return clip;
     // Whatever route it came by, an image or file copied as text arrives as itself.
     std::vector<std::string> errors;
     clip->items = armor::expand(std::move(clip->items), &errors);
-    if (!errors.empty() && clip->items.empty()) return fail("{}", errors.front());
+    if (!errors.empty() && clip->items.empty()) return fail(Code::corrupt, "{}", errors.front());
     return clip;
 }
 
@@ -420,7 +470,10 @@ auto agent_source() -> Source {
     return [](std::uint64_t max, std::uint32_t hops) {
         PasteOptions o;
         o.max_bytes = max;
-        return paste_impl(o, hops, false);
+        o.tmux_buffer = false;  // a background agent has no pane to ask
+        auto routes = plan(Situation{}, config());
+        std::erase(routes, Route::terminal);
+        return walk(routes, o, hops, false);
     };
 }
 

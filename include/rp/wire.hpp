@@ -7,7 +7,7 @@
 //   response: "RPA1" u8 status
 //             status 0: u32 count, then count items:
 //                       u8 kind  str16 mime  str16 name  u64 size  bytes[size]  sha256[32]
-//             status 1: str16 message
+//             status 1: str16 message  u8 code (rp::Code; absent from older agents)
 //
 // str16 is a u16 length followed by that many bytes.
 
@@ -96,7 +96,7 @@ auto encode_request(const Request& r) -> Bytes;
 auto decode_request(ByteView b) -> Result<Request>;
 
 auto encode_items(std::span<const Item> items) -> Bytes;
-auto encode_error(std::string_view message) -> Bytes;
+auto encode_error(std::string_view message, Code code = Code::other) -> Bytes;
 // Parses a whole response. Checks every hash and turns raw fields into typed Items.
 auto decode_response(ByteView b) -> Result<std::vector<Item>>;
 

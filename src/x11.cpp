@@ -204,7 +204,7 @@ public:
             auto units = get32(*r, 16);
             std::size_t bytes = out.format == 0 ? 0 : static_cast<std::size_t>(units) * (out.format / 8);
             if (r->size() < 32 + bytes) return fail("short GetProperty reply");
-            if (out.data.size() + bytes > max) return fail("clipboard data is larger than the {} limit", human_size(max));
+            if (out.data.size() + bytes > max) return fail(Code::too_big, "clipboard data is larger than the {} limit", human_size(max));
             out.data.insert(out.data.end(), r->begin() + 32, r->begin() + 32 + static_cast<std::ptrdiff_t>(bytes));
             if (after == 0) return out;
             offset += static_cast<std::uint32_t>(bytes / 4);
@@ -344,7 +344,7 @@ auto read(const std::string& display, std::uint64_t max_bytes) -> Result<std::ve
     if (!clipboard || !targets || !incr || !prop) return fail("could not intern X atoms");
     auto owner = c->selection_owner(*clipboard);
     if (!owner) return std::unexpected(owner.error());
-    if (*owner == None) return fail("clipboard is empty");
+    if (*owner == None) return fail(Code::empty, "clipboard is empty");
     auto win = c->create_window();
     if (!win) return std::unexpected(win.error());
 

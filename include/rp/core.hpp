@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -16,8 +17,43 @@ namespace rp {
 using Bytes = std::vector<std::byte>;
 using ByteView = std::span<const std::byte>;
 
+// What went wrong, for code to act on. `what` is for people; never parse it.
+enum class Code : std::uint8_t {
+    other = 0,
+    empty,        // the clipboard has nothing on it
+    too_big,      // over the size limit
+    refused,      // the owner said no (terminal EPERM, bad token)
+    no_answer,    // asked a terminal, nothing came back in time
+    unreachable,  // no agent at that address (dead forward, not running)
+    no_display,   // no display server to read here
+    corrupt,      // data arrived but failed a check (hash, base64, framing)
+    no_route,     // every route was tried; see causes
+    needs_terminal,  // only the terminal is left, and the caller gave no session to ask it
+};
+
+auto code_name(Code c) -> std::string_view;
+
+// Where a paste came from, or may come from.
+enum class Route : std::uint8_t {
+    socket,       // the one agent socket set in Config::socket
+    forward,      // an ssh-forwarded agent on the machine you type on
+    display,      // this machine's own clipboard
+    tmux_buffer,  // tmux asks the outer terminal, we read its paste buffer
+    terminal,     // we ask the terminal ourselves (OSC 5522 / 52)
+};
+
+auto route_name(Route r) -> std::string_view;
+
 struct Error {
+    Code code = Code::other;
     std::string what;
+    std::vector<Error> causes;    // for no_route: one per route tried
+    std::optional<Route> route;   // the route that failed, when paste() knows
+
+    // True if this error or any cause has code c.
+    [[nodiscard]] auto any(Code c) const -> bool;
+    // The cause from route r, if that route was tried.
+    [[nodiscard]] auto from(Route r) const -> const Error*;
 };
 
 template <class T>
@@ -25,7 +61,16 @@ using Result = std::expected<T, Error>;
 
 template <class... Args>
 [[nodiscard]] auto fail(std::format_string<Args...> fmt, Args&&... args) -> std::unexpected<Error> {
-    return std::unexpected(Error{std::format(fmt, std::forward<Args>(args)...)});
+    return std::unexpected(Error{Code::other, std::format(fmt, std::forward<Args>(args)...), {}, {}});
+}
+template <class... Args>
+[[nodiscard]] auto fail(Code code, std::format_string<Args...> fmt, Args&&... args) -> std::unexpected<Error> {
+    return std::unexpected(Error{code, std::format(fmt, std::forward<Args>(args)...), {}, {}});
+}
+// Same error with "<prefix>: " in front of the message, code kept.
+inline auto context(Error e, std::string_view prefix) -> std::unexpected<Error> {
+    e.what = std::format("{}: {}", prefix, e.what);
+    return std::unexpected(std::move(e));
 }
 
 template <class... Fs>

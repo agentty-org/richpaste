@@ -74,7 +74,7 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
         if (j == std::string::npos) break;
         i = j + 1;
     }
-    if (types.empty() || (types.size() == 1 && types[0].empty())) return fail("clipboard is empty");
+    if (types.empty() || (types.size() == 1 && types[0].empty())) return fail(Code::empty, "clipboard is empty");
     auto has = [&](std::string_view t) { return std::ranges::contains(types, t); };
 
     auto tmp_dir = fs::temp_directory_path() / ("richpaste-" + random_hex(8));
@@ -126,7 +126,7 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
     }
     std::string list;
     for (auto& t : types) list += (list.empty() ? "" : ", ") + t;
-    return fail("nothing pasteable on the clipboard (offered: {})", list.substr(0, 200));
+    return fail(Code::empty, "nothing pasteable on the clipboard (offered: {})", list.substr(0, 200));
 }
 
 }  // namespace rp::mac

@@ -101,6 +101,39 @@ auto encode(const Item& item) -> std::string {
 
 auto contains(std::string_view text) -> bool { return text.contains(magic); }
 
+auto progress(std::string_view s) -> Progress {
+    Progress out;
+    for (auto at = s.find(magic); at != std::string_view::npos; at = s.find(magic, at + magic.size())) {
+        out.state = Progress::State::complete;
+        std::size_t p = at + magic.size();
+        std::optional<std::string> f[4];
+        for (auto& x : f) {
+            x = field(s, p);
+            if (!x) break;
+        }
+        if (!f[3]) {
+            // No ':' yet: still arriving if we ran off the end, else broken.
+            if (p >= s.size()) return {Progress::State::partial, 0, 0};
+            continue;
+        }
+        std::uint64_t size = 0;
+        auto [ptr, ec] = std::from_chars(f[2]->data(), f[2]->data() + f[2]->size(), size);
+        if (ec != std::errc{} || ptr != f[2]->data() + f[2]->size() || size > (1ull << 30)) continue;
+        const std::size_t need = (size + 2) / 3 * 4;
+        std::size_t got = 0;
+        while (p < s.size() && got < need) {
+            if (is_b64(s[p])) ++got;
+            else if (!is_space(s[p])) break;
+            ++p;
+        }
+        // Short, and the text just ends: more is coming. Short and something
+        // else follows: it was cut, split() will say so.
+        if (got < need && p >= s.size()) return {Progress::State::partial, std::min<std::uint64_t>(got / 4 * 3, size), size};
+        at = p - magic.size();
+    }
+    return out;
+}
+
 auto split(std::string_view s) -> Split {
     Split out;
     std::size_t i = 0;

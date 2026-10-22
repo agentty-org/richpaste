@@ -77,11 +77,12 @@ auto encode_items(std::span<const Item> items) -> Bytes {
     return std::move(w).bytes();
 }
 
-auto encode_error(std::string_view message) -> Bytes {
+auto encode_error(std::string_view message, Code code) -> Bytes {
     Writer w;
     w.put_magic(response_magic);
     w.put(std::uint8_t{1});
     w.put_str16(message.substr(0, 4000));
+    w.put(std::to_underlying(code));
     return std::move(w).bytes();
 }
 
@@ -93,7 +94,10 @@ auto decode_response(ByteView b) -> Result<std::vector<Item>> {
     if (*status == 1) {
         auto msg = r.str16();
         if (!msg) return std::unexpected(msg.error());
-        return fail("{}", repair_utf8(*msg));
+        // Older agents send no code byte.
+        auto code = r.remaining() ? r.get<std::uint8_t>() : Result<std::uint8_t>{0};
+        auto c = code && *code <= std::to_underlying(Code::needs_terminal) ? static_cast<Code>(*code) : Code::other;
+        return fail(c, "{}", repair_utf8(*msg));
     }
     if (*status != 0) return fail("unknown response status {}", *status);
 
@@ -114,12 +118,12 @@ auto decode_response(ByteView b) -> Result<std::vector<Item>> {
         auto digest = r.take(32);
         if (!data || !digest) return fail("truncated item {}", i);
         auto actual = sha256(*data);
-        if (!std::ranges::equal(*digest, actual)) return fail("item {} is corrupted (sha256 mismatch)", i);
+        if (!std::ranges::equal(*digest, actual)) return fail(Code::corrupt, "item {} is corrupted (sha256 mismatch)", i);
         auto item = make_item(static_cast<Kind>(*kind), *mime, *name, *data);
         if (!item) return fail("item {}: {}", i, item.error().what);
         items.push_back(std::move(*item));
     }
-    if (r.remaining() != 0) return fail("{} trailing bytes after response", r.remaining());
+    if (r.remaining() != 0) return fail(Code::corrupt, "{} trailing bytes after response", r.remaining());
     return items;
 }
 
