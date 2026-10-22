@@ -1,6 +1,7 @@
 #!/bin/sh
-# Real browser: put a PNG on the X clipboard, open the page in Firefox, press Ctrl+V,
-# and check the page put a valid richpaste:1: line back on the clipboard.
+# Real browser: put a big screenshot-like PNG on the X clipboard, open the page in
+# Firefox, press Ctrl+V, and check the page put a valid richpaste:1: line back on the
+# clipboard that decodes to a smaller image of at most 1600 px on a side.
 # Needs: firefox, xdotool, xsel, an X server.  Usage: DISPLAY=:91 tests/browser_page.sh
 set -u
 unset AGENTTY_HOME WAYLAND_DISPLAY   # firefox must open on $DISPLAY, not your desktop
@@ -11,7 +12,20 @@ T=$(mktemp -d /tmp/rp-br.XXXXXX)
 cleanup() { [ -n "${FF:-}" ] && kill "$FF" 2>/dev/null; [ -n "${OW:-}" ] && kill "$OW" 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 "$BIN" page > "$T/rp.html"
-head -c 400000 /dev/urandom > "$T/shot.png"
+python3 - "$T/shot.png" <<'EOF'
+import sys, zlib, struct
+def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+w, h = 2880, 1800   # a retina screenshot: big, mostly flat colour with some detail
+rows = []
+for y in range(h):
+    r = bytearray(b'\x00')
+    for x in range(w):
+        r += bytes(((x // 40) * 9 & 255, (y // 30) * 7 & 255, (x * y) & 255 if (x // 200 + y // 120) % 7 == 0 else 200))
+    rows.append(bytes(r))
+png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
+open(sys.argv[1], 'wb').write(png)
+EOF
 "$OWNER" "${DISPLAY#:}" image/png "$T/shot.png" >/dev/null & OW=$!
 sleep 0.3
 mkdir -p "$T/prof"
@@ -39,8 +53,18 @@ for _ in $(seq 1 30); do
 done
 xsel -b -o > "$T/clip.txt" 2>/dev/null
 P=$("$BIN" decode "$T/out" < "$T/clip.txt" 2>"$T/err" | head -1)
-if [ -n "$P" ] && cmp -s "$P" "$T/shot.png"; then
-    echo "ok   firefox: pasted image -> page -> richpaste:1: on clipboard -> byte-identical"
+# The page scales a screenshot to <= 1600 px and keeps the smallest of PNG/WebP/JPEG.
+DIMS=$(python3 - "$P" <<'EOF' 2>/dev/null
+import sys, struct
+b = open(sys.argv[1], 'rb').read()
+if b[:8] == b'\x89PNG\r\n\x1a\n': print(*struct.unpack('>II', b[16:24]))
+elif b[:4] == b'RIFF' and b[8:12] == b'WEBP': print('webp')
+elif b[:2] == b'\xff\xd8': print('jpeg')
+EOF
+)
+IN=$(wc -c < "$T/shot.png"); OUTSZ=$(wc -c < "$T/clip.txt")
+if [ -n "$P" ] && [ -n "$DIMS" ] && [ "$OUTSZ" -lt "$IN" ]; then
+    echo "ok   firefox: $IN-byte screenshot -> page -> $OUTSZ-char line -> valid image ($DIMS)"
 else
     echo "FAIL firefox page"; echo "clipboard starts: [$OUT]"; cat "$T/err"
     exit 1
