@@ -57,12 +57,22 @@ if command -v node >/dev/null; then
     node -e "
 const fs=require('fs');const html=fs.readFileSync(process.argv[1],'utf8');
 const js=html.split('<script>')[1].split('</script>')[0];
-const pre='const el={focus(){},addEventListener(){}};const document={getElementById:()=>el,addEventListener(){}};const navigator={};';
+const pre='const mk=()=>({focus(){},addEventListener(){},append(){},replaceChildren(){},classList:{add(){},remove(){},toggle(){}},textContent:String(),innerHTML:String(),hidden:true});const stubEl=mk();const document={getElementById:()=>stubEl,createElement:mk,addEventListener(){}};const navigator={};';
 const module={exports:{}};new Function('module','crypto','btoa',pre+js)(module,globalThis.crypto,globalThis.btoa);
 module.exports.armor('image/png','',new Uint8Array(fs.readFileSync(process.argv[2]))).then(s=>fs.writeFileSync(process.argv[3],s));
 " "$T/rp.html" "$T/shot.png" "$T/js.txt"
     P=$("$BIN" decode "$T/o6" < "$T/js.txt" | head -1)
     cmp -s "$P" "$T/shot.png" && ok "browser page encoder -> decoder, byte-identical" || bad "browser page"
+    # The page must not be able to reach the network, and its CSP must allow
+    # exactly its own script and style (a stale hash would break the page).
+    node -e "
+const fs=require('fs'),c=require('crypto');const h=fs.readFileSync(process.argv[1],'utf8');
+const csp=(h.match(/Content-Security-Policy\" content=\"([^\"]+)/)||[])[1]||String();
+const hash=s=>'sha256-'+c.createHash('sha256').update(s).digest('base64');
+const js=h.split('<script>')[1].split('</script>')[0],css=h.split('<style>')[1].split('</style>')[0];
+const ok=/default-src 'none'/.test(csp)&&/connect-src 'none'/.test(csp)&&csp.includes(hash(js))&&csp.includes(hash(css))
+  &&(h.match(/<script/g)||[]).length===1&&!/ src=|href=\"(?!https:\/\/agentty\.org)/.test(h);
+process.exit(ok?0:1)" "$T/rp.html" && ok "page CSP: no network, only its own script and style" || bad "page CSP"
 fi
 
 # 7. the macOS snippet only uses tools that ship with macOS
