@@ -4,8 +4,11 @@
 #
 # Runs a throwaway sshd on 127.0.0.1:22999 with its own keys. Touches nothing in ~/.ssh.
 set -eu
+unset AGENTTY_HOME
 
-BIN=$(cd "$(dirname "$0")/.." && pwd)/build/rp_driver
+# Resolve symlinks: `pkill -f "$BIN agent"` must match the path the agent was
+# started with, or a stray agent outlives the test and answers the next one.
+BIN=$(readlink -f "$(cd "$(dirname "$0")/.." && pwd)/build/rp_driver")
 T=$(mktemp -d /tmp/rp-e2e.XXXXXX)
 LAPTOP_HOME=$T/laptop          # HOME of the "machine you type on"
 mkdir -p "$LAPTOP_HOME/.agentty/paste"
@@ -41,7 +44,9 @@ EOF
 /usr/bin/sshd -f "$T/sshd_config" -E "$T/sshd.log"
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$T/sshd.pid" ] && break; sleep 0.1; done
 
-# ssh config exactly as `richpaste setup` writes it, plus the test host.
+# Nothing in this test may read your real clipboard, including the agent setup starts.
+export RICHPASTE_NO_DISPLAY=1
+# ssh config exactly as `agentty paste setup` writes it, plus the test host.
 HOME=$LAPTOP_HOME "$BIN" setup >/dev/null 2>&1 || true
 SNIPPET=$(sed -n '/# richpaste:/,/# richpaste end/p' "$LAPTOP_HOME/.ssh/config")
 cat > "$T/ssh_config" <<EOF
@@ -56,7 +61,6 @@ Host rptest
   LogLevel ERROR
 EOF
 # setup started a real agent for that HOME; swap in one that serves a fixed PNG.
-export RICHPASTE_NO_DISPLAY=1  # nothing in this test may read your real clipboard
 pkill -f "$BIN agent" 2>/dev/null || true
 sleep 0.2
 head -c 2500000 /dev/urandom > "$T/shot.png"

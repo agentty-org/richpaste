@@ -20,8 +20,9 @@ trap cleanup EXIT
 printf 'clipboard_control write-clipboard write-primary read-clipboard read-primary\nconfirm_os_window_close 0\n' > "$T/kitty.conf"
 
 # The app runs with no display env, no agent and no forwards: only the terminal can help.
-# Also drop this shell's own tmux/ssh vars so they don't leak into the test terminals.
-unset TMUX TMUX_PANE SSH_CONNECTION SSH_TTY SSH_CLIENT
+# Also drop this shell's own tmux/ssh vars so they don't leak into the test terminals,
+# and WAYLAND_DISPLAY so kitty opens on $DISPLAY (the test X server), not your desktop.
+unset TMUX TMUX_PANE SSH_CONNECTION SSH_TTY SSH_CLIENT WAYLAND_DISPLAY
 APPENV="env -u DISPLAY -u WAYLAND_DISPLAY RICHPASTE_NO_DISPLAY=1 HOME=$T/home"
 mkdir -p "$T/home"
 

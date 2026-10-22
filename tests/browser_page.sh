@@ -3,7 +3,7 @@
 # and check the page put a valid richpaste:1: line back on the clipboard.
 # Needs: firefox, xdotool, xsel, an X server.  Usage: DISPLAY=:91 tests/browser_page.sh
 set -u
-unset AGENTTY_HOME
+unset AGENTTY_HOME WAYLAND_DISPLAY   # firefox must open on $DISPLAY, not your desktop
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=$ROOT/build/rp_driver
 OWNER=$ROOT/build/x11_owner
