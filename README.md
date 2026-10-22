@@ -1,129 +1,86 @@
 # richpaste
 
-Paste anything into a terminal app, the way you would into a browser text box.
-Text, screenshots, copied files. Locally, over ssh, inside tmux, through several hops.
-Linux, macOS and Windows.
+The clipboard library inside [agentty](https://github.com/1ay1/agentty). It reads
+text, screenshots and copied files: locally, over ssh, inside tmux, through several
+hops. Native on Linux, macOS and Windows. No libraries, C++23.
 
-One static binary. No libraries. C++23.
+There is no richpaste program. Users run it as `agentty paste ...`, and agentty's
+Ctrl+V calls `rp::paste()`.
 
 ## The problem
 
 You sit at a laptop. The app runs on a server you ssh'd into, maybe inside tmux.
-You copy a screenshot and press Ctrl+V in the app. Nothing happens.
+You copy a screenshot and press Ctrl+V. Nothing happens, because:
 
-Why it breaks:
+1. **The terminal only carries typed text.** With an image on the clipboard there is
+   no text, so most terminals send nothing.
+2. **The clipboard is on the wrong machine.** It lives in the laptop's display
+   server. The server can't reach it.
+3. **Escape-sequence reads are patchy.** OSC 52 is text only and often off; tmux
+   filters it. Kitty's OSC 5522 carries images, but few terminals have it.
+4. **Environment variables go stale.** A tmux pane keeps yesterday's `SSH_AUTH_SOCK`.
+5. **Paths lie.** A dropped file's path exists on the laptop, not on the server.
 
-1. **The terminal is the only pipe, and it only carries typed text.**
-   When you paste, the terminal reads *its* clipboard and types the text into the pty.
-   If the clipboard holds an image, there is no text, so most terminals send nothing.
-   The app never even learns that you tried to paste.
+## Routes
 
-2. **The clipboard is on the wrong machine.**
-   The app runs on the server. Your clipboard lives on the laptop, inside a display
-   server (Wayland, X11, macOS, Windows). The server can't reach it. There is no
-   remote clipboard API.
+The terminal is only used for the keypress. richpaste then fetches the clipboard by
+the best route there is:
 
-3. **Escape-sequence tricks are patchy.**
-   OSC 52 can read the clipboard, but it's text only, many terminals turn reads off,
-   and tmux filters it. Kitty's OSC 5522 carries images, but only some terminals have it.
-
-4. **tmux keeps stale state.**
-   A pane started during yesterday's ssh session still has yesterday's environment.
-   Anything found through an env var points at a socket that died with that session.
-
-5. **Paths lie.** Drag a file into a terminal and you get a path. That path exists
-   on your laptop, not on the server.
-
-## The fix
-
-Use the terminal only for the keypress. Fetch the clipboard yourself, by the best
-route that exists, and fall back down the list:
-
-| # | Route | What you need | Carries |
-|---|-------|---------------|---------|
-| 1 | **ssh forward** to the agent on your machine | `richpaste setup` once on your machine | text, images, files |
-| 2 | **the terminal itself** (OSC 5522) | kitty-style terminal | text, images, files |
-| 3 | **the terminal itself** (OSC 52) | terminal that allows clipboard reads | text |
+| # | Route | Needs | Carries |
+|---|-------|-------|---------|
+| 1 | **ssh forward** to the agent on your machine | `agentty paste setup` once there | text, images, files |
+| 2 | **the terminal** (OSC 5522) | kitty-style terminal | text, images, files |
+| 3 | **the terminal** (OSC 52) | terminal that allows clipboard reads | text |
 | 4 | **this machine's display** | you're local | text, images, files |
-| 5 | **pasted as text** (`richpaste:1:` line) | a built-in helper on your machine (below) | text, images, files |
+| 5 | **pasted as text** (`richpaste:1:` line) | a built-in helper on your machine | text, images, files |
 
-Inside ssh, 1 → 2/3. Locally, 4 first. tmux is handled in every route. Over ssh the
-server's own clipboard is never used, because it isn't the one you copied into.
-
-Whatever route a paste comes by, a `richpaste:1:` line in it turns back into the image or
-file. So for terminals that can't share the clipboard (Terminal.app, Windows Terminal),
-you turn the image into text on your machine, then paste normally.
+Inside ssh, 1 then 2/3. Locally, 4 first. Over ssh the server's own clipboard is never
+used, since it isn't the one you copied into. Whatever route a paste takes, a
+`richpaste:1:` line in it turns back into the image or file.
 
 ```
-laptop                                         server
-richpaste agent  <── ssh RemoteForward ──>  /tmp/richpaste-you-<random>.sock
-reads your real clipboard                      ^
-                                               app connects when you press Ctrl+V
-kitty / any OSC 5522 terminal  <── escape codes through the pty (and tmux) ──> app
+laptop                                              server
+agentty paste agent  <── ssh RemoteForward ──>  /tmp/richpaste-you-<random>.sock
+reads your clipboard                                ^
+                                                    agentty connects on Ctrl+V
 ```
 
-- **Ctrl+V** is the single byte `0x16`; every terminal and tmux pass it through.
-  **Alt+V** works too, for terminals that keep Ctrl+V for themselves.
-- **The ssh forward** never touches the pty, so tmux can't get in the way.
-  Each connection gets a fresh socket name; the app tries the newest first and
-  deletes dead ones, so old tmux panes keep working after you reconnect.
-- **Through the terminal**, inside tmux, escapes are wrapped in tmux passthrough
-  (turned on for that one pane only). For OSC 52, tmux is asked to fetch the
-  clipboard itself (`refresh-client -l`), which works with default tmux settings.
-  Every query is followed by a DA1 fence, so a terminal that ignores it costs
-  one round trip, not a timeout.
-- **The agent reads the real clipboard** and picks the best format: copied files
-  first, then images (png before jpeg and so on), then text. Every item carries its
-  MIME type, its bytes and a sha256. Windows bitmaps (Print Screen) become PNG.
-- **The app checks everything** before trusting it: magic, sizes, hashes, UTF-8,
-  MIME syntax, file names (no `../`). Bad data is an error, never a crash.
+- **The ssh forward** never touches the pty, so tmux can't get in the way. Each
+  connection gets a fresh socket; the newest is tried first and dead ones are
+  removed, so old tmux panes keep working after you reconnect.
+- **Through the terminal**, tmux gets passthrough-wrapped escapes, or is asked to
+  fetch the clipboard itself for OSC 52. Every query is fenced with DA1, so a
+  terminal that ignores it costs one round trip, not a timeout.
+- **Formats:** copied files first, then images (png before jpeg...), then text. Each
+  item carries its MIME type, bytes and sha256. Windows bitmaps become PNG.
+- **Everything is checked:** magic, sizes, hashes, UTF-8, MIME syntax, file names
+  (no `../`). Bad data is an error, never a crash.
 
-## Use it
+## Platforms
 
-On the machine you type on (any OS):
+All native: no helper tools, no extra libraries to install.
 
-```sh
-richpaste setup
-```
+| | Reads with | Terminal route | Agent listens on |
+|---|---|---|---|
+| Linux, Wayland | data-control, spoken over the socket (no libwayland) | /dev/tty | unix socket |
+| Linux, X11 | core protocol over the socket (no Xlib), INCR for big data | /dev/tty | unix socket |
+| macOS | NSPasteboard through JavaScript for Automation (ships with macOS) | /dev/tty | unix socket |
+| Windows | Win32: CF_HDROP, PNG, CF_DIBV5/CF_DIB, CF_UNICODETEXT | console in VT mode | 127.0.0.1 TCP |
 
-That adds an ssh `Match exec` hook to the top of `~/.ssh/config` and starts the agent.
-Every ssh connection (except git hosts) then carries your clipboard. On Windows it
-works with the built-in OpenSSH client (`ssh.exe`).
+Writing text: Win32 `CF_UNICODETEXT` on Windows (`rp::write_clipboard_text`).
+agentty uses pbcopy / wl-copy / xclip elsewhere.
 
-On the server, put the Linux (or macOS) binary in your `PATH`. Then, in any app:
+On Windows the agent is on loopback TCP, which every local user can reach. It only
+answers your own Windows user (checked through the connection's owning process), or a
+client holding the random token in `%USERPROFILE%\.agentty\paste\agent.tcp`.
 
-```sh
-richpaste demo                 # an input box: Ctrl+V / Alt+V pastes text, images, files
-richpaste paste                # prints text, or saves images/files and prints their paths
-richpaste doctor               # shows which route paste would use, and why
-```
-
-If you skip `setup`, paste still works in kitty (any type) and in terminals that
-allow OSC 52 reads (text).
-
-### Terminals that only paste text (Terminal.app, Windows Terminal)
-
-These never hand the clipboard to programs, so an image has to become text on your
-machine first. Nothing to install; `richpaste howto` prints the details:
-
-- **macOS hotkey:** a Shortcuts "Run Shell Script" bound to Ctrl+Cmd+V. It encodes the
-  clipboard, presses Cmd+V for you and puts the clipboard back. Built-in tools only
-  (`osascript`, `base64`, `shasum`, `pbcopy`).
-- **Windows:** a PowerShell one-liner (`richpaste win-snippet`), then paste as usual.
-- **Any OS:** `richpaste page > rp.html`, open it in a browser, paste the image there,
-  then paste the text it copies into the terminal.
-
-The line is `richpaste:1:<mime>:<name>:<size>:<sha256>:<base64>`. It survives wrapping
-and CRLF changes; a cut-short or corrupted paste is rejected, never saved broken.
-
-From C++, the whole client is one call:
+## API
 
 ```cpp
 #include "rp/agent.hpp"
 
-rp::PasteOptions opt;
-opt.tty_in = opt.tty_out = tty_fd;   // optional: lets it ask the terminal (tty in raw mode)
-auto clip = rp::paste(opt);          // Result<Clip>: items + which route they came from
+rp::PasteOptions opt;            // set opt.terminal to also ask the terminal
+auto clip = rp::paste(opt);      // Result<Clip>: items + which route they came from
 if (!clip) show_error(clip.error().what);
 for (auto& item : clip->items)
     std::visit(rp::overloaded{
@@ -133,22 +90,16 @@ for (auto& item : clip->items)
     }, item);
 ```
 
-`Item` is `std::variant<Text, Image, File>`. Every type is built only by a parser,
-so a `FileName` can't hold `../x`, a `Text` is always valid UTF-8 and an `Image`
-always has an `image/*` type. Errors are `std::expected` values, never exceptions.
+`Item` is `std::variant<Text, Image, File>`. Every type is built only by a parser, so
+a `FileName` can't hold `../x`, a `Text` is always valid UTF-8 and an `Image` always
+has an `image/*` type. Errors are `std::expected` values, never exceptions.
 
-## Platforms
+Also: `rp::armor` (the text form), `rp::store` (save items by content hash),
+`rp::remote_forward` (the `-R` pair for callers that run ssh themselves), and
+`rp::cli::run` (the whole `agentty paste` command line). `rp::set_program` changes
+how the command line names and re-runs itself; the defaults are agentty's.
 
-| | Reads the clipboard with | Agent listens on |
-|---|---|---|
-| Linux, Wayland | data-control protocol, spoken over the socket (no libwayland) | unix socket |
-| Linux, X11 | core protocol over the socket (no Xlib), INCR for big data | unix socket |
-| macOS | NSPasteboard through JavaScript for Automation (ships with macOS) | unix socket |
-| Windows | Win32 clipboard: CF_HDROP, PNG, CF_DIBV5/CF_DIB, CF_UNICODETEXT | 127.0.0.1 TCP |
-
-On Windows the agent is on loopback TCP, which every local user can reach. It only
-answers your own Windows user (checked through the connection's owning process),
-or a client holding the random token in `%USERPROFILE%\.richpaste\agent.tcp`.
+State lives in `$AGENTTY_HOME/paste`, else `~/.agentty/paste`.
 
 ## Layout
 
@@ -158,71 +109,46 @@ include/rp/wire.hpp       the agent protocol (one request, one response)
 src/wayland.cpp           Wayland data-control client
 src/x11.cpp               X11 CLIPBOARD client
 src/clip_mac.cpp          macOS pasteboard
-src/clip_win.cpp          Windows clipboard
+src/clip_win.cpp          Windows clipboard (read + text write)
 src/image.cpp             DIB decoder, PNG encoder, deflate (for Windows bitmaps)
 src/inband.cpp            OSC 5522 / OSC 52 / tmux clipboard through the terminal
 src/clipboard.cpp         format choice, file URI lists, display discovery
 src/agent.cpp             agent, relay, forwarded-socket lookup, ssh hook, paste()
+src/store.cpp             saving pasted images and files
+src/term.cpp              the terminal in raw mode (POSIX tty, Windows console)
+src/cli.cpp               the `agentty paste` command line
 src/io_posix.cpp          sockets, files, processes (Linux, macOS)
 src/io_win.cpp            the same on Windows
-src/composer.cpp          input box model: glyphs and attachment chips
-src/term.cpp              tty raw mode (POSIX + Windows console), keys, renderer
 ```
 
-## Build
+## Build and test
+
+agentty builds it with `add_subdirectory`. On its own, for its tests:
 
 ```sh
 cmake -S . -B build -G Ninja && cmake --build build
-cmake -S . -B build-static -DRICHPASTE_STATIC=ON -DCMAKE_BUILD_TYPE=MinSizeRel   # any Linux
-cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw.cmake -DRICHPASTE_STATIC=ON  # Windows
-```
-
-macOS: same as Linux with Apple clang (`-DRICHPASTE_STATIC=OFF`).
-
-## Tests
-
-```sh
-./build/rp_tests                          # unit: protocol, parsers, base64, PNG, 5522, keys
+./build/rp_tests                          # unit: protocol, parsers, base64, PNG, 5522, store
 ./tests/e2e_ssh.sh                        # real sshd: ssh, tmux, stale panes, relay, restart
-DISPLAY=:N ./tests/inband_kitty.sh        # real kitty: OSC 5522/52, tmux, ssh, the input box
-DISPLAY=:N ./tests/wine_clip.sh build-win # Windows build under wine: clipboard formats, agent, ssh
+DISPLAY=:N ./tests/inband_kitty.sh        # real kitty: OSC 5522/52, tmux, ssh
 ./tests/armor.sh                          # images as text: wrapping, corruption, tmux paste
 DISPLAY=:N ./tests/browser_page.sh        # the web page in real firefox
 python3 tests/png_check.py build/png_tool /tmp   # our PNG against an independent decoder
 ```
 
-The ssh tests start their own sshd on a random port and never touch `~/.ssh` or
-your clipboard. The terminal tests need an X server (Xvfb works).
+`build/rp_driver` stands in for `agentty paste` in the shell tests. The ssh tests start
+their own sshd on a random port and never touch `~/.ssh` or your clipboard. The
+terminal tests need an X server (Xvfb works).
 
 ## Hard limits
 
-These can't be engineered away:
-
-- **Something on your machine has to hand the clipboard over.** That is the agent,
-  a terminal that answers clipboard reads, or one of the text helpers above. A terminal
-  with none of these (Terminal.app, Windows Terminal, wezterm, alacritty) can't give a
-  server your clipboard. richpaste says so in about a second instead of hanging.
+- **Something on your machine has to hand the clipboard over:** the agent, a terminal
+  that answers clipboard reads, or a text helper (`agentty paste howto`). Without one,
+  paste says so in about a second instead of hanging.
 - **Ctrl+V has to reach the app.** Windows Terminal and VS Code keep Ctrl+V for their
-  own paste. Use Alt+V there, or unbind Ctrl+V. Terminals that send an empty
-  bracketed paste for an image clipboard also trigger a fetch.
-- **Terminal reads ask permission.** Kitty asks before letting a program read the
-  clipboard, unless you allow it (`clipboard_control ... read-clipboard`). That's
-  kitty protecting you; richpaste can't and shouldn't bypass it.
+  own paste; use Alt+V there. An empty bracketed paste also triggers a fetch.
+- **Terminal reads ask permission.** Kitty asks before a program reads the clipboard,
+  unless allowed (`clipboard_control ... read-clipboard`).
 - **Trust is the same as ssh-agent forwarding.** While you're connected, any process
-  running as you (or root) on that server can ask for your clipboard. Only forward to
-  servers you'd forward your ssh-agent to. `Match` lets you limit hosts.
-- **GNOME on Wayland** has no data-control protocol. The agent reads through Xwayland,
-  which works for most apps.
-- **mosh** can't forward sockets. Paste then falls back to the terminal routes.
-
-## Status
-
-Tested end to end here: Linux agent on Wayland (live Hyprland) and X11, ssh, tmux,
-nested tmux, stale panes, multi-hop relay, kitty OSC 5522 (direct, in tmux, over ssh
-with nothing installed on the laptop), OSC 52 (direct and via tmux), the Windows
-build under wine (text, bitmaps, PNG, Explorer file copy, agent auth, and a Windows
-agent serving a Linux server over a real ssh forward).
-
-macOS compiles (cross-built with zig) but hasn't run on a Mac yet, and neither have the
-macOS hotkey or the PowerShell snippet. The browser page was tested in real Firefox.
-Under wine, Windows' own ssh.exe wasn't available, so the Linux ssh client stood in for it.
+  running as you (or root) on that server can ask for your clipboard. `Match` limits hosts.
+- **GNOME on Wayland** has no data-control protocol; the agent reads through Xwayland.
+- **mosh** can't forward sockets. Paste falls back to the terminal routes.

@@ -122,10 +122,10 @@ auto from_display(std::uint64_t max, Attempt& a) -> std::optional<Result<Clip>> 
 }
 
 auto from_terminal(const PasteOptions& opt, Attempt& a) -> std::optional<Result<Clip>> {
-    if (opt.tty_in < 0 || opt.tty_out < 0) return std::nullopt;
+    if (!opt.terminal) return std::nullopt;
     if (env("RICHPASTE_NO_TERMINAL")) return std::nullopt;
-    auto caps = inband::detect(opt.tty_in, opt.tty_out, Millis(1500));
-    inband::Session s{opt.tty_in, opt.tty_out, caps};
+    inband::Session s = *opt.terminal;
+    auto caps = inband::detect(s, Millis(1500));
     auto r = inband::read_clipboard(s, opt.max_bytes, Millis(3000));
     auto via = caps.osc5522 ? "terminal (OSC 5522)" : caps.tmux ? "terminal via tmux (OSC 52)" : "terminal (OSC 52)";
     if (r) return Clip{std::move(*r), via};
@@ -227,7 +227,8 @@ auto self_command(std::string_view sub) -> std::vector<std::string> {
 
 auto state_dir() -> fs::path {
     if (!program().state_dir.empty()) return program().state_dir;
-    return home_dir() / ".richpaste";
+    if (auto h = env("AGENTTY_HOME"); h && !h->empty()) return fs::path(*h) / "paste";
+    return home_dir() / ".agentty" / "paste";
 }
 auto ssh_forward_conf() -> fs::path { return state_dir() / "ssh"; }
 
@@ -267,7 +268,7 @@ void serve_one(int fd, const Source& source, std::string_view token, bool quiet)
         // Windows: loopback TCP is open to every local user, so require the token
         // unless the caller is this same Windows user (ssh.exe forwards run as you).
         out = wire::encode_error("wrong agent token");
-        if (!quiet) std::println(stderr, "richpaste: refused a request with a wrong token");
+        if (!quiet) std::println(stderr, "{}: refused a request with a wrong token", program().name);
     } else {
         auto clip = source(r->max_total_bytes, r->hops + 1);
         out = encode_clip(clip, r->max_total_bytes);

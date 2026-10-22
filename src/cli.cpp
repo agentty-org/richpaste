@@ -1,8 +1,8 @@
 #include "rp/agent.hpp"
 #include "rp/armor.hpp"
 #include "rp/cli.hpp"
-#include "rp/composer.hpp"
 #include "rp/sha256.hpp"
+#include "rp/store.hpp"
 #include "rp/term.hpp"
 
 #include <algorithm>
@@ -34,11 +34,12 @@ auto usage() -> int {
                  "anywhere (local or over ssh):\n"
                  "  {0}{1} [-o DIR]  print text, or save images/files and print paths\n"
                  "  {0} doctor       show what paste would use and why\n"
-                 "  {0} demo         an input box; Ctrl+V (or Alt+V) pastes text, images, files\n"
                  "\n"
                  "when nothing reaches your clipboard (e.g. Terminal.app over ssh):\n"
                  "  {0} howto        one-time Mac/Windows setup to paste images as text\n"
-                 "  {0} page         a web page that turns a pasted image into text\n",
+                 "  {0} page         a web page that turns a pasted image into text\n"
+                 "  {0} encode FILE  FILE as one line of text; paste it anywhere\n"
+                 "  {0} decode [DIR] turn such text on stdin back into files\n",
                  n, paste_line);
     return 2;
 }
@@ -54,7 +55,7 @@ void print_items(const Clip& clip, const fs::path& dir) {
     for (auto& part : pasted->parts)
         std::visit(overloaded{
                        [](const std::string& t) { std::print("{}", t); },
-                       [](const Chip& c) { std::println("{}", c.path.string()); },
+                       [](const Saved& s) { std::println("{}", s.path.string()); },
                    },
                    part);
     std::fflush(stdout);
@@ -65,10 +66,7 @@ auto paste_with_terminal(std::uint64_t max) -> Result<Clip> {
     PasteOptions o;
     o.max_bytes = max;
     auto tty = term::Tty::open();
-    if (tty) {
-        o.tty_in = tty->in_fd();
-        o.tty_out = tty->out_fd();
-    }
+    if (tty) o.terminal = tty->session();
     return paste(o);
 }
 
@@ -174,188 +172,6 @@ auto cmd_howto() -> int {
     return 0;
 }
 
-// ---- demo input box ----
-
-constexpr std::string_view help = "Ctrl+V or Alt+V paste  Enter send  Alt+Enter newline  Ctrl+C quit";
-
-auto cmd_demo() -> int {
-    auto tty = term::Tty::open();
-    if (!tty) {
-        std::println(stderr, "{}: {}", program().name, tty.error().what);
-        return 1;
-    }
-    Composer box;
-    term::Parser parser;
-    term::View view;
-    view.status = help;
-    int rows_above = 0;
-    auto out = [&](std::string_view s) { (void)tty->write(s); };
-    auto draw = [&] {
-        view.width = tty->size().first;
-        auto [s, r] = term::render(box, view, rows_above);
-        out(s);
-        rows_above = r;
-    };
-    auto set_status = [&](std::string s) {
-        view.status = std::move(s);
-        draw();
-    };
-
-    auto do_paste = [&] {
-        set_status("pasting...");
-        // The terminal fallback reads replies straight off the tty, so nothing else may read it now.
-        PasteOptions o;
-        o.tty_in = tty->in_fd();
-        o.tty_out = tty->out_fd();
-        auto clip = paste(o);
-        if (!clip) {
-            // No route to your clipboard. The terminal's own paste still works for text,
-            // so tell the user how to turn an image into text first.
-            set_status(std::format("your terminal won't share the clipboard over ssh. one-time Mac setup: run `{} howto`", program().name));
-            return;
-        }
-        auto pasted = store(clip->items, paste_dir());
-        if (!pasted) {
-            set_status("paste failed: " + pasted.error().what);
-            return;
-        }
-        for (auto& part : pasted->parts)
-            std::visit(overloaded{
-                           [&](const std::string& t) { box.insert_text(t); },
-                           [&](const Chip& c) { box.insert_chip(c); },
-                       },
-                       part);
-        set_status(std::format("pasted from {}", clip->source));
-    };
-
-    auto submit = [&] {
-        // Move below the box, print what was sent, start a fresh box.
-        view.status.clear();
-        draw();
-        out("\r\n");
-        std::string shown;
-        for (char ch : box.to_text()) shown += ch == '\n' ? std::string("\r\n  ") : std::string(1, ch);
-        out(std::format("\x1b[2msent:\x1b[22m {}\r\n", shown));
-        for (auto& c : box.chips())
-            out(std::format("  \x1b[2m{} {} sha256:{}\x1b[22m\r\n", c.mime, human_size(c.size), c.sha256.substr(0, 16)));
-        box.clear();
-        rows_above = 0;
-        set_status(std::string(help));
-    };
-
-    draw();
-    std::array<std::byte, 4096> buf;
-    for (;;) {
-        auto n = tty->read(buf, parser.pending() ? Millis(30) : Millis(1 << 30));
-        if (!n) {
-            if (auto k = parser.flush_escape()) parser.feed({});
-            continue;
-        }
-        if (*n == 0) break;
-        parser.feed(std::span(buf).first(*n));
-        bool quit = false;
-        while (auto k = parser.next()) {
-            std::visit(overloaded{
-                           [&](const term::key::Char& c) { box.insert_text(c.utf8); },
-                           [&](const term::key::Paste& p) {
-                               // Some terminals send an empty paste when the clipboard holds an image.
-                               if (p.text.empty()) {
-                                   do_paste();
-                                   return;
-                               }
-                               if (!armor::contains(p.text)) {
-                                   box.insert_text(p.text);
-                                   return;
-                               }
-                               // Text-armored images/files: decode back into the real bytes.
-                               std::vector<std::string> errs;
-                               auto items = armor::expand({Text::repair(p.text)}, &errs);
-                               auto stored = store(items, paste_dir());
-                               if (stored) {
-                                   for (auto& part : stored->parts)
-                                       std::visit(overloaded{
-                                                      [&](const std::string& s) { box.insert_text(s); },
-                                                      [&](const Chip& c) { box.insert_chip(c); },
-                                                  },
-                                                  part);
-                               }
-                               if (!errs.empty()) view.status = "paste: " + errs.front();
-                               else if (!stored) view.status = "paste: " + stored.error().what;
-                               else view.status = std::format("pasted {} item(s) from text", items.size());
-                           },
-                           [&](const term::key::Ctrl& c) {
-                               switch (c.letter) {
-                                   case 'v': do_paste(); break;
-                                   case 'c': case 'd': quit = true; break;
-                                   case 'a': box.home(); break;
-                                   case 'e': box.end(); break;
-                                   case 'b': box.left(); break;
-                                   case 'f': box.right(); break;
-                                   case 'w': box.word_left(); break;
-                                   case 'u': box.kill_line_before(); break;
-                                   case 'j': box.insert_text("\n"); break;
-                                   default: break;
-                               }
-                           },
-                           // For terminals that keep Ctrl+V for themselves (Windows Terminal, VS Code).
-                           [&](const term::key::Alt& a) {
-                               if (a.letter == 'v') do_paste();
-                           },
-                           [&](const term::key::Enter&) {
-                               if (!box.empty()) submit();
-                           },
-                           [&](const term::key::AltEnter&) { box.insert_text("\n"); },
-                           [&](const term::key::Backspace&) { box.backspace(); },
-                           [&](const term::key::Delete&) { box.del(); },
-                           [&](const term::key::Left&) { box.left(); },
-                           [&](const term::key::Right&) { box.right(); },
-                           [&](const term::key::Home&) { box.home(); },
-                           [&](const term::key::End&) { box.end(); },
-                           [&](const term::key::Escape&) {},
-                       },
-                       *k);
-            if (quit) break;
-        }
-        if (quit) break;
-        if (!parser.in_paste()) draw();
-    }
-    view.status.clear();
-    draw();
-    out("\r\n");
-    return 0;
-}
-
-// Test helper: serve one fixed file as the clipboard on a unix socket.
-auto cmd_serve_file(Args args) -> int {
-    if (args.size() < 3) return usage();
-    fs::path socket = args[1];
-    fs::path file = args[2];
-    std::string kind = args.size() > 3 ? args[3] : "image";
-    auto data = read_file(file, 1ull << 32);
-    if (!data) {
-        std::println(stderr, "{}: {}", program().name, data.error().what);
-        return 1;
-    }
-    Item item = [&]() -> Item {
-        if (kind == "text") return Text::repair(as_string(*data));
-        if (kind == "file") {
-            auto name = FileName::sanitize(file.filename().string());
-            auto mime = mime_for_name(name.str());
-            return File{std::move(name), std::move(mime), *data};
-        }
-        auto mime = mime_for_name(file.filename().string());
-        if (!mime.is_image()) mime = *Mime::parse("image/png");
-        return Image{std::move(mime), *data};
-    }();
-    Source src = [item](std::uint64_t, std::uint32_t) -> Result<Clip> { return Clip{{item}, "file"}; };
-    auto r = run_agent_at(socket, src, false);
-    if (!r) {
-        std::println(stderr, "{}: {}", program().name, r.error().what);
-        return 1;
-    }
-    return 0;
-}
-
 }  // namespace
 
 namespace rp::cli {
@@ -418,7 +234,7 @@ auto run(std::span<const std::string> in) -> int {
         return sp.errors.empty() && !items.empty() ? 0 : 1;
     }
     if (cmd == "encode") {
-        // Test helper: armor a file.
+        // A file as one line of text, to paste through a text-only terminal.
         if (args.size() < 2) return usage();
         auto data = read_file(args[1], 1u << 30);
         if (!data) return 1;
@@ -430,17 +246,6 @@ auto run(std::span<const std::string> in) -> int {
     }
     if (cmd == "paste") return cmd_paste(args);
     if (cmd == "doctor") return cmd_doctor();
-    if (cmd == "demo") return cmd_demo();
-    if (cmd == "serve-file") return cmd_serve_file(args);
-    if (cmd == "test-fetch-notoken") {
-        // Test helper: ask the local agent without its token (Windows same-user check).
-        auto e = local_endpoint();
-        if (!e) return 1;
-        if (auto* t = std::get_if<TcpEndpoint>(&*e)) t->token.clear();
-        auto r = fetch(*e, 1 << 20);
-        std::println("{}", r ? "served" : r.error().what);
-        return r ? 0 : 1;
-    }
     return usage();
 }
 

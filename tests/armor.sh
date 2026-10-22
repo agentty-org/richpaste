@@ -2,8 +2,9 @@
 # Text armor: an image/file survives a plain-text terminal paste, over ssh, inside tmux.
 # Also checks the browser page's encoder (with node) produces what the decoder accepts.
 set -u
+unset AGENTTY_HOME
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=$ROOT/build/richpaste
+BIN=$ROOT/build/rp_driver
 T=$(mktemp -d /tmp/rp-armor.XXXXXX)
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "ok   $1"; }
@@ -34,19 +35,16 @@ import sys;b=bytearray(open(sys.argv[1],'rb').read());i=len(b)//2;b[i]=ord('A') 
 "$BIN" decode "$T/o4" < "$T/bad.txt" 2> "$T/e4" >/dev/null && bad "corrupt accepted" || \
     { grep -q "sha256" "$T/e4" && ok "corrupted paste rejected (sha256)" || { bad "corrupt msg"; cat "$T/e4"; }; }
 
-# 4. real bracketed paste into the demo, inside tmux over a pty (what Cmd+V does)
-tmux -L rparm -f /dev/null new-session -d -x 120 -y 10 "env RICHPASTE_NO_DISPLAY=1 HOME=$T/home $BIN demo"
+# 4. real bracketed paste inside tmux over a pty (what Cmd+V does), read back by decode
+tmux -L rparm -f /dev/null new-session -d -x 120 -y 10 "sh -c 'stty raw -echo; head -c $(wc -c < "$T/a.txt") > $T/pasted.txt'"
 sleep 0.6
-tmux -L rparm send-keys 'look: '
 tmux -L rparm load-buffer "$T/a.txt"
 tmux -L rparm paste-buffer -p      # -p = bracketed, like a real terminal paste
 sleep 2
-tmux -L rparm capture-pane -p > "$T/screen"
-tmux -L rparm send-keys Enter; sleep 0.5
-tmux -L rparm capture-pane -p > "$T/screen2"
-grep -q "look: \[image png 2.9 MB\]" "$T/screen" && grep -q "sha256:$WANT" "$T/screen2" \
-    && ok "demo in tmux: 3 MB pasted as text becomes the image, sha matches" || { bad "demo paste"; cat "$T/screen" "$T/screen2"; }
 tmux -L rparm kill-server 2>/dev/null
+P=$("$BIN" decode "$T/o4b" < "$T/pasted.txt" 2>/dev/null | head -1)
+[ -n "$P" ] && [ "$(sha256sum < "$P" | cut -c1-16)" = "$WANT" ] \
+    && ok "tmux paste: 3 MB pasted as text becomes the image, sha matches" || bad "tmux paste"
 
 # 5. a file keeps its name
 printf 'quarterly numbers\n' > "$T/report.csv"

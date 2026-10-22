@@ -3,8 +3,9 @@
 # and check the page put a valid richpaste:1: line back on the clipboard.
 # Needs: firefox, xdotool, xsel, an X server.  Usage: DISPLAY=:91 tests/browser_page.sh
 set -u
+unset AGENTTY_HOME
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=$ROOT/build/richpaste
+BIN=$ROOT/build/rp_driver
 OWNER=$ROOT/build/x11_owner
 T=$(mktemp -d /tmp/rp-br.XXXXXX)
 cleanup() { [ -n "${FF:-}" ] && kill "$FF" 2>/dev/null; [ -n "${OW:-}" ] && kill "$OW" 2>/dev/null; rm -rf "$T"; }

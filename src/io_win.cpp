@@ -12,6 +12,8 @@
 #include <bcrypt.h>
 #include <iphlpapi.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <vector>
 
@@ -320,8 +322,72 @@ auto spawn_detached(const fs::path& exe, std::span<const std::string> args, cons
     return {};
 }
 
-auto run_capture(std::span<const std::string>, Millis) -> Result<std::string> {
-    return fail("not supported on Windows");
+auto run_capture(std::span<const std::string> args, Millis timeout) -> Result<std::string> {
+    if (args.empty()) return fail("nothing to run");
+    std::wstring cmd;
+    for (auto& a : args) cmd += (cmd.empty() ? L"" : L" ") + quote_arg(fs::path(a).wstring());
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!::CreatePipe(&rd, &wr, &sa, 0)) return fail("pipe: {}", errno_str());
+    ::SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = ::CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                               OPEN_EXISTING, 0, nullptr);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul;
+    si.hStdOutput = wr;
+    si.hStdError = nul;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                               &pi);
+    auto err = ::GetLastError();
+    ::CloseHandle(wr);
+    if (nul != INVALID_HANDLE_VALUE) ::CloseHandle(nul);
+    if (!ok) {
+        ::CloseHandle(rd);
+        return fail("{}: {}", args[0], win_error(err));
+    }
+    ::CloseHandle(pi.hThread);
+
+    // Small outputs (tmux queries); read until EOF or the deadline.
+    std::string out;
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    char buf[4096];
+    for (;;) {
+        DWORD avail = 0;
+        if (!::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;  // EOF
+        if (avail) {
+            DWORD n = 0;
+            if (!::ReadFile(rd, buf, std::min<DWORD>(avail, sizeof(buf)), &n, nullptr) || n == 0) break;
+            out.append(buf, n);
+            if (out.size() > (1u << 20)) break;
+            continue;
+        }
+        if (::WaitForSingleObject(pi.hProcess, 10) == WAIT_OBJECT_0) {
+            // Drain what's left after exit.
+            DWORD n = 0;
+            while (::PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail &&
+                   ::ReadFile(rd, buf, std::min<DWORD>(avail, sizeof(buf)), &n, nullptr) && n)
+                out.append(buf, n);
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            ::TerminateProcess(pi.hProcess, 1);
+            ::CloseHandle(pi.hProcess);
+            ::CloseHandle(rd);
+            return fail("{} timed out", args[0]);
+        }
+    }
+    ::WaitForSingleObject(pi.hProcess, static_cast<DWORD>(timeout.count()));
+    DWORD code = 1;
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(rd);
+    if (code != 0) return fail("{} failed", args[0]);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
 }
 
 }  // namespace rp

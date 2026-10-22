@@ -43,7 +43,7 @@ auto hex_of(ByteView b) -> std::string {
 }
 
 auto passwd_field(int field) -> std::optional<std::string> {
-    // Avoids getpwuid so a static binary needs no glibc NSS at runtime.
+    // Avoids getpwuid so static agentty builds need no glibc NSS at runtime.
     auto file = read_file("/etc/passwd", 16 << 20);
     if (!file) return std::nullopt;
     auto uid = current_uid();

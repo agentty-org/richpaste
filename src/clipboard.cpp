@@ -141,6 +141,15 @@ auto choose(const Offer& offer, std::uint64_t max_bytes) -> Result<std::vector<I
 
 auto has_display_env() -> bool { return env("WAYLAND_DISPLAY") || env("DISPLAY"); }
 
+auto write_clipboard_text(std::string_view utf8) -> Result<void> {
+#if defined(_WIN32)
+    return win::write_text(utf8);
+#else
+    (void)utf8;
+    return fail("no native clipboard write on this platform");
+#endif
+}
+
 auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip> {
     if (env("RICHPASTE_NO_DISPLAY")) return fail("no display server found (RICHPASTE_NO_DISPLAY is set)");
 #if defined(_WIN32)

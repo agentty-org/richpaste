@@ -24,6 +24,10 @@ struct Clip {
 // Reads this machine's clipboard directly (Wayland data-control, then X11).
 auto read_clipboard(std::uint64_t max_bytes) -> Result<Clip>;
 
+// Puts UTF-8 text on this machine's clipboard. Native on Windows (Win32);
+// elsewhere it fails and the caller uses pbcopy / wl-copy / xclip or OSC 52.
+auto write_clipboard_text(std::string_view utf8) -> Result<void>;
+
 // True if this process can see a display server to read from.
 auto has_display_env() -> bool;
 
@@ -35,6 +39,8 @@ auto read(const std::string& display, std::uint64_t max_bytes) -> Result<std::ve
 }
 namespace win {
 auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>>;
+// Puts UTF-8 text on the clipboard as CF_UNICODETEXT.
+auto write_text(std::string_view utf8) -> Result<void>;
 }
 namespace mac {
 auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>>;

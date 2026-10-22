@@ -200,7 +200,7 @@ private:
 
 auto send(const Session& s, std::string_view esc) -> Result<void> {
     auto wrapped = s.caps.tmux && s.caps.passthrough ? tmux_wrap(esc) : std::string(esc);
-    return write_all(s.out_fd, as_view(wrapped), Millis(1000));
+    return s.write(wrapped);
 }
 
 // Sends q, then a DA1 as a fence. Every terminal answers DA1, and replies come in order,
@@ -216,7 +216,7 @@ auto exchange(const Session& s, std::string_view q, Millis timeout, F&& on_reply
     for (;;) {
         auto left = std::chrono::duration_cast<Millis>(deadline - std::chrono::steady_clock::now());
         if (left.count() <= 0) return fail("terminal did not answer");
-        auto n = read_some(s.in_fd, buf, left);
+        auto n = s.read(buf, left);
         if (!n) return fail("terminal did not answer");
         if (*n == 0) return fail("terminal closed");
         sc.feed(std::span(buf).first(*n));
@@ -231,7 +231,7 @@ auto exchange(const Session& s, std::string_view q, Millis timeout, F&& on_reply
 
 }  // namespace
 
-auto detect(int in_fd, int out_fd, Millis timeout) -> Caps {
+auto detect(Session& s, Millis timeout) -> Caps {
     Caps c;
     // $TMUX can be stale (inherited by a terminal started from inside tmux), so ask tmux.
     if (env("TMUX") && env("TMUX_PANE")) {
@@ -248,10 +248,11 @@ auto detect(int in_fd, int out_fd, Millis timeout) -> Caps {
     } else {
         c.terminal = env("TERM_PROGRAM").or_else([] { return env("TERM"); }).value_or("");
     }
-    Session s{in_fd, out_fd, c};
+    s.caps = c;
     // Override for terminals that misreport: RICHPASTE_TERMINAL=osc52 | 5522.
     if (auto force = env("RICHPASTE_TERMINAL")) {
         c.osc5522 = *force == "5522";
+        s.caps = c;
         return c;
     }
     (void)exchange(s, "\x1b[?5522$p", timeout, [&](const Reply& r) -> Result<void> {
@@ -259,6 +260,7 @@ auto detect(int in_fd, int out_fd, Millis timeout) -> Caps {
         if (r.kind == Kind5::decrqm && (r.body == "1" || r.body == "2")) c.osc5522 = true;
         return {};
     });
+    s.caps = c;
     return c;
 }
 

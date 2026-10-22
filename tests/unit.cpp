@@ -2,11 +2,10 @@
 
 #include "rp/armor.hpp"
 #include "rp/clipboard.hpp"
-#include "rp/composer.hpp"
 #include "rp/image.hpp"
 #include "rp/inband.hpp"
 #include "rp/sha256.hpp"
-#include "rp/term.hpp"
+#include "rp/store.hpp"
 #include "rp/wire.hpp"
 
 #include <print>
@@ -151,70 +150,26 @@ void test_choose() {
     check(paths.size() == 2 && paths[0] == "/tmp/a b.png" && paths[1] == "/etc/hosts", "uri list parsed");
 }
 
-void test_composer() {
-    Composer c;
-    c.insert_text("héllo");
-    check(c.cells().size() == 5, "5 glyphs");
-    c.insert_text("e\xCC\x81");  // e + combining acute
-    check(c.cells().size() == 6, "combining mark joins base");
-    c.insert_text("👩‍💻");
-    check(c.cells().size() == 7, "zwj emoji is one cell");
-    c.backspace();
-    check(c.cells().size() == 6, "backspace removes whole emoji");
-    c.insert_chip(Chip{Kind::image, "image/png", "image png 1 KB", "/tmp/x.png", 1024, "ab"});
-    c.insert_text(" after");
-    c.home();
-    check(c.cursor() == 0, "home");
-    c.end();
-    check(c.cursor() == c.cells().size(), "end");
-    for (int i = 0; i < 6; ++i) c.left();
-    c.backspace();
-    check(c.chips().empty(), "backspace deletes chip as one unit");
-    c.clear();
-    c.insert_text("a\r\nb\rc\x1b[31m");
-    check(c.to_text() == "a\nb\nc[31m", "newlines normalized, ESC stripped");
-}
-
-void test_parser() {
-    term::Parser p;
-    p.feed(as_view("a\x16\x1b[200~line1\nline2\x1b[201~\x1b[D\x7f"));
-    auto k1 = p.next();
-    check(k1 && std::get<term::key::Char>(*k1).utf8 == "a", "char");
-    auto k2 = p.next();
-    check(k2 && std::get<term::key::Ctrl>(*k2).letter == 'v', "ctrl+v is 0x16");
-    auto k3 = p.next();
-    check(k3 && std::get<term::key::Paste>(*k3).text == "line1\nline2", "bracketed paste");
-    auto k4 = p.next();
-    check(k4 && std::holds_alternative<term::key::Left>(*k4), "left arrow");
-    auto k5 = p.next();
-    check(k5 && std::holds_alternative<term::key::Backspace>(*k5), "backspace");
-
-    // Paste split across reads, with the end marker split too.
-    term::Parser q;
-    q.feed(as_view("\x1b[20"));
-    check(!q.next(), "partial start waits");
-    q.feed(as_view("0~abc\x1b[2"));
-    check(!q.next(), "paste body waits");
-    q.feed(as_view("01~"));
-    auto kp = q.next();
-    check(kp && std::get<term::key::Paste>(*kp).text == "abc", "split paste joined");
-
-    term::Parser r;
-    r.feed(as_view("\x1b[118;5u"));
-    auto kr = r.next();
-    check(kr && std::get<term::key::Ctrl>(*kr).letter == 'v', "kitty ctrl+v");
-
-    term::Parser e;
-    e.feed(as_view("\x1b"));
-    check(!e.next(), "lone esc waits");
-    check(e.flush_escape().has_value(), "lone esc flushes");
-
-    term::Parser a;
-    a.feed(as_view("\x1bv\x1b[118;3u"));
-    auto ka = a.next();
-    check(ka && std::get<term::key::Alt>(*ka).letter == 'v', "alt+v as ESC v");
-    auto kb = a.next();
-    check(kb && std::get<term::key::Alt>(*kb).letter == 'v', "alt+v as CSI u");
+void test_store() {
+    auto dir = std::filesystem::temp_directory_path() / ("rp-store-" + random_hex(6));
+    Bytes png(64, std::byte{7});
+    std::vector<Item> items{Text::repair("see "), Image{*Mime::parse("image/png"), png},
+                            File{FileName::sanitize("a.pdf"), *Mime::parse("application/pdf"), png}};
+    auto r = store(items, dir);
+    check(r && r->parts.size() == 3, "store: three parts");
+    if (r && r->parts.size() == 3) {
+        check(std::get<std::string>(r->parts[0]) == "see ", "store: text passes through");
+        auto& img = std::get<Saved>(r->parts[1]);
+        check(img.path.extension() == ".png" && img.size == 64, "store: image saved as .png");
+        auto& f = std::get<Saved>(r->parts[2]);
+        check(f.path.filename().string().ends_with("-a.pdf"), "store: file keeps its name");
+        auto back = read_file(img.path, 1 << 20);
+        check(back && *back == png, "store: bytes on disk match");
+        auto again = store(items, dir);
+        check(again && std::get<Saved>(again->parts[1]).path == img.path, "store: same bytes, same path");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 void test_base64() {
@@ -310,8 +265,7 @@ int main() {
     test_types();
     test_wire();
     test_choose();
-    test_composer();
-    test_parser();
+    test_store();
     test_base64();
     test_inband();
     test_image();

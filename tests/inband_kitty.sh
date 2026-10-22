@@ -4,8 +4,9 @@
 # Needs: kitty, tmux, an X server for kitty (Xvfb is fine), xsel.
 # Usage: DISPLAY=:N tests/inband_kitty.sh
 set -u
+unset AGENTTY_HOME
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=$ROOT/build/richpaste
+BIN=$ROOT/build/rp_driver
 OWNER=$ROOT/build/x11_owner
 T=$(mktemp -d /tmp/rp-ib.XXXXXX)
 PASS=0; FAIL=0
@@ -69,28 +70,9 @@ if command -v wezterm >/dev/null; then
     LIBGL_ALWAYS_SOFTWARE=1 timeout 30 wezterm --config 'front_end="Software"' --config 'window_close_confirmation="NeverPrompt"' \
         start --always-new-process -- sh -c "$APPENV $BIN paste > $T/out5 2>&1" >/dev/null 2>&1
     END=$(date +%s)
-    grep -q "richpaste setup" "$T/out5" && [ $((END-START)) -lt 15 ] \
+    grep -q "rp_driver setup" "$T/out5" && [ $((END-START)) -lt 15 ] \
         && ok "wezterm (no clipboard reads): clear error in $((END-START))s" || { bad "silent terminal"; cat "$T/out5"; }
 fi
-
-# --- the real input box: Ctrl+V in kitty pastes an image chip ---
-"$OWNER" "$DNUM" image/png "$T/shot.png" >/dev/null & OW=$!
-sleep 0.3
-rm -f "$T/kitty-sock"
-LIBGL_ALWAYS_SOFTWARE=1 timeout 40 kitty --config "$T/kitty.conf" -o allow_remote_control=yes --listen-on "unix:$T/kitty-sock" \
-    sh -c "$APPENV $BIN demo" >/dev/null 2>&1 &
-KP=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$T/kitty-sock" ] && break; sleep 0.3; done
-sleep 1
-kitty @ --to "unix:$T/kitty-sock" send-text 'see: ' >/dev/null 2>&1
-kitty @ --to "unix:$T/kitty-sock" send-text '\x16' >/dev/null 2>&1
-sleep 2.5
-kitty @ --to "unix:$T/kitty-sock" get-text > "$T/screen" 2>/dev/null
-kitty @ --to "unix:$T/kitty-sock" send-text '\x03' >/dev/null 2>&1
-sleep 0.3; kill "$KP" 2>/dev/null
-grep -q "see: \[image png 146.5 KB\]" "$T/screen" && grep -q "pasted from terminal (OSC 5522)" "$T/screen" \
-    && ok "demo: Ctrl+V in kitty shows the image chip" || { bad "demo in kitty"; cat "$T/screen"; }
-kill "$OW"; OW=
 
 # --- image copied *as text* (snippet/web page output), Ctrl+V in kitty via plain OSC 52 ---
 "$BIN" encode "$T/shot.png" > "$T/armored.txt"

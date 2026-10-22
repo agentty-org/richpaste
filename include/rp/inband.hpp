@@ -11,6 +11,7 @@
 #include "rp/core.hpp"
 #include "rp/io.hpp"
 
+#include <functional>
 #include <optional>
 
 namespace rp::inband {
@@ -54,16 +55,16 @@ auto query_5522_read(std::span<const std::string> mimes, std::string_view pw = {
 // Picks which mime types to fetch from a listing. Same order as the native readers.
 auto choose_mimes(std::span<const std::string> offered) -> std::vector<std::string>;
 
-// Blocking, self-contained session on a tty fd in raw mode. Used by `richpaste paste`
-// and by apps that don't want to run their own parser. Apps with an event loop should
-// feed Events from their own parser instead (see term::Parser).
+// A blocking session with the terminal, in raw mode. Read and write are
+// whatever reaches it: a tty fd on POSIX, the console on Windows. Nothing
+// else may read the terminal during a call.
 struct Session {
-    int in_fd;
-    int out_fd;
+    std::function<Result<std::size_t>(std::span<std::byte>, Millis)> read;  // 0 = closed
+    std::function<Result<void>(std::string_view)> write;
     Caps caps;
 };
 
-auto detect(int in_fd, int out_fd, Millis timeout) -> Caps;
+auto detect(Session& s, Millis timeout) -> Caps;
 auto read_clipboard(const Session& s, std::uint64_t max_bytes, Millis timeout) -> Result<std::vector<Item>>;
 
 // Asks tmux to fetch the outer terminal's clipboard (OSC 52) and returns the text.

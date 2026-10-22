@@ -1,25 +1,26 @@
 #pragma once
 
 #include "rp/clipboard.hpp"
+#include "rp/inband.hpp"
 #include "rp/io.hpp"
 
+#include <optional>
 #include <variant>
 
 namespace rp {
 
 inline constexpr std::uint64_t default_max_bytes = 256ull << 20;
 
-// How this program names and re-runs itself. An app that ships richpaste as a
-// subcommand sets this once at startup, before any thread, e.g.
-//   set_program({"agentty paste", {}, {"paste"}});
-// so messages say `agentty paste setup` and the agent and ssh hook run
-// `agentty paste agent` / `agentty paste ssh-hook`.
+// How the host program names and re-runs itself. agentty sets this once at
+// startup, before any thread, so messages say `agentty paste setup` and the
+// agent and ssh hook run `agentty paste agent` / `agentty paste ssh-hook`.
+// The defaults match agentty.
 struct Program {
-    std::string name = "richpaste";      // used in messages
+    std::string name = "agentty paste";   // used in messages
     std::filesystem::path exe;            // empty: this executable
-    std::vector<std::string> args;        // put before the subcommand
-    std::string default_command;          // run when no subcommand is given; empty: usage
-    std::filesystem::path state_dir;      // agent socket, log, saved pastes; empty: ~/.richpaste
+    std::vector<std::string> args{"paste"};  // put before the subcommand
+    std::string default_command = "paste";   // run when no subcommand is given; empty: usage
+    std::filesystem::path state_dir;      // agent socket, log, saved pastes; empty: ~/.agentty/paste
 };
 void set_program(Program p);
 auto program() -> const Program&;
@@ -72,10 +73,9 @@ enum class Route { env_socket, forward, display, terminal };
 
 struct PasteOptions {
     std::uint64_t max_bytes = default_max_bytes;
-    // tty to ask the terminal on (OSC 5522 / 52). -1 = never ask the terminal.
-    // The tty must be in raw mode, and nothing else may read it during the call.
-    int tty_in = -1;
-    int tty_out = -1;
+    // How to ask the terminal (OSC 5522 / 52). Unset = never ask it.
+    // Nothing else may read the terminal during the call.
+    std::optional<inband::Session> terminal;
 };
 
 // The one call an app needs: finds the right clipboard and returns what's on it.

@@ -1,4 +1,5 @@
-// Windows clipboard reader: files (CF_HDROP), PNG, bitmaps (CF_DIBV5/CF_DIB -> PNG), Unicode text.
+// Windows clipboard: reads files (CF_HDROP), PNG, bitmaps (CF_DIBV5/CF_DIB -> PNG),
+// Unicode text; writes Unicode text.
 #ifdef _WIN32
 
 #include "rp/clipboard.hpp"
@@ -151,6 +152,32 @@ auto read(std::uint64_t max_bytes) -> Result<std::vector<Item>> {
         if (list.size() > 200) break;
     }
     return fail("nothing pasteable on the clipboard (offered: {})", list);
+}
+
+auto write_text(std::string_view text) -> Result<void> {
+    // UTF-16 with a trailing NUL, in movable global memory the clipboard then owns.
+    int n = text.empty()
+                ? 0
+                : ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (!text.empty() && n == 0) return fail("text is not valid UTF-8");
+    HGLOBAL mem = ::GlobalAlloc(GMEM_MOVEABLE, (static_cast<std::size_t>(n) + 1) * sizeof(wchar_t));
+    if (!mem) return fail("out of memory");
+    auto* w = static_cast<wchar_t*>(::GlobalLock(mem));
+    if (n) ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), w, n);
+    w[n] = L'\0';
+    ::GlobalUnlock(mem);
+
+    auto cb = Clipboard::open();
+    if (!cb) {
+        ::GlobalFree(mem);
+        return std::unexpected(cb.error());
+    }
+    ::EmptyClipboard();
+    if (!::SetClipboardData(CF_UNICODETEXT, mem)) {
+        ::GlobalFree(mem);
+        return fail("SetClipboardData failed");
+    }
+    return {};
 }
 
 }  // namespace rp::win

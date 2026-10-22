@@ -1,24 +1,20 @@
 cmake_minimum_required(VERSION 3.25)
 project(richpaste LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+# richpaste is agentty's clipboard library (agentty paste). It has no program
+# of its own; tests/driver.cpp is a small test-only stand-in.
+
+if(PROJECT_IS_TOP_LEVEL)
+  set(CMAKE_CXX_STANDARD 23)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_CXX_EXTENSIONS OFF)
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+  endif()
 endif()
 
-option(RICHPASTE_STATIC "Link fully static so one binary runs anywhere" OFF)
 option(RICHPASTE_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
-option(RICHPASTE_TOOL "Build the richpaste executable" ${PROJECT_IS_TOP_LEVEL})
-
-if(PROJECT_IS_TOP_LEVEL AND NOT MSVC)
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
-endif()
-if(RICHPASTE_STATIC AND PROJECT_IS_TOP_LEVEL)
-  add_link_options(-static)
-endif()
 
 add_library(rp STATIC
   src/core.cpp
@@ -36,11 +32,15 @@ add_library(rp STATIC
   src/inband.cpp
   src/armor.cpp
   src/agent.cpp
-  src/composer.cpp
+  src/store.cpp
   src/term.cpp
   src/cli.cpp
 )
 target_include_directories(rp PUBLIC include)
+target_compile_features(rp PUBLIC cxx_std_23)
+if(PROJECT_IS_TOP_LEVEL AND NOT MSVC)
+  target_compile_options(rp PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
+endif()
 if(WIN32)
   target_compile_definitions(rp PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00)
   target_link_libraries(rp PUBLIC ws2_32 bcrypt shell32 iphlpapi advapi32 user32)
@@ -48,23 +48,18 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(rp PUBLIC Threads::Threads)
 
-if(RICHPASTE_TOOL)
-  add_executable(richpaste src/main.cpp)
-  target_link_libraries(richpaste PRIVATE rp)
-endif()
-
 if(RICHPASTE_TESTS)
   enable_testing()
   add_executable(rp_tests tests/unit.cpp)
   target_link_libraries(rp_tests PRIVATE rp)
   add_test(NAME unit COMMAND rp_tests)
+  # Stands in for agentty in the shell tests (tests/*.sh).
+  add_executable(rp_driver tests/driver.cpp)
+  target_link_libraries(rp_driver PRIVATE rp)
   add_executable(png_tool tests/png_tool.cpp)
   target_link_libraries(png_tool PRIVATE rp)
   if(NOT WIN32)
     add_executable(x11_owner tests/x11_owner.cpp)
     target_link_libraries(x11_owner PRIVATE rp)
-  else()
-    add_executable(win_setclip tests/win_setclip.cpp)
-    target_link_libraries(win_setclip PRIVATE rp user32)
   endif()
 endif()
