@@ -50,6 +50,11 @@ if(WIN32)
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(rp PUBLIC Threads::Threads)
+# std::print's Windows terminal path (__open_terminal / __write_to_terminal)
+# lives in libstdc++'s experimental archive on mingw gcc.
+if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_link_libraries(rp PUBLIC stdc++exp)
+endif()
 
 if(RICHPASTE_TESTS)
   enable_testing()
