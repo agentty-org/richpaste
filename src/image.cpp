@@ -100,8 +100,10 @@ auto channel(std::uint32_t px, std::uint32_t mask) -> std::uint8_t {
     auto shift = std::countr_zero(mask);
     auto bits = std::popcount(mask);
     auto v = (px & mask) >> shift;
+    if (bits >= 8) return static_cast<std::uint8_t>(v >> (bits - 8));
+    // bits < 8 here, so the shift is in range (a 32-bit mask would be UB).
     auto maxv = (1u << bits) - 1;
-    return static_cast<std::uint8_t>(bits >= 8 ? v >> (bits - 8) : (v * 255 + maxv / 2) / maxv);
+    return static_cast<std::uint8_t>((v * 255 + maxv / 2) / maxv);
 }
 
 }  // namespace

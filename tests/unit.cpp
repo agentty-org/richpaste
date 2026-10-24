@@ -491,6 +491,23 @@ void test_image() {
         check(png.size() > 50 && png[1] == std::byte{'P'}, "png encoded");
     }
     check(!image::decode_dib(ByteView(dib).first(50)), "truncated dib rejected");
+
+    // 32-bit BI_BITFIELDS with a full 0xFFFFFFFF mask. Used to shift a
+    // 32-bit value by 32 (UB); found by tests/fuzz in agentty.
+    Bytes bf(40 + 12 + 4);
+    auto put32b = [&](std::size_t o, std::uint32_t v) { for (int i = 0; i < 4; ++i) bf[o + i] = std::byte(v >> (8 * i)); };
+    put32b(0, 40);
+    put32b(4, 1);
+    put32b(8, 1);
+    bf[12] = std::byte{1};
+    bf[14] = std::byte{32};
+    put32b(16, 3);   // BI_BITFIELDS
+    put32b(40, 0xFFFFFFFF);
+    put32b(44, 0x0000FF00);
+    put32b(48, 0x000000FF);
+    put32b(52, 0x12345678);
+    auto full = image::decode_dib(bf);
+    check(full && full->width == 1 && full->height == 1, "dib with a 32-bit mask decodes");
 }
 
 void test_deflate_roundtrip_shape() {
